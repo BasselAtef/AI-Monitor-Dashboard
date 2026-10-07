@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sign in — AI System Health Dashboard</title>
+    <title>Sign in — AI System Monitor Dashboard</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -25,7 +25,22 @@
             width: 100%;
             text-align: center;
         }
-        h1 { font-size: 22px; color: #667eea; margin-bottom: 8px; }
+        h1 {
+            font-size: 22px;
+            color: #667eea;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .logo-mark {
+            width: 1em;
+            height: 1em;
+            flex: none;
+            display: block;
+        }
         .sub { color: #666; font-size: 14px; margin-bottom: 28px; line-height: 1.5; }
         .btn {
             display: inline-flex;
@@ -53,7 +68,7 @@
 </head>
 <body>
     <div class="card">
-        <h1>🤖 AI System Health Dashboard</h1>
+        <h1>{% include '_logo.html' %} AI System Monitor Dashboard</h1>
         <p class="sub">Sign in to view your LLM telemetry, costs, and anomalies.</p>
 
         {% if error %}

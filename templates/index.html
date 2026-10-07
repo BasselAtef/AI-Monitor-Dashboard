@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI System Health Dashboard</title>
+    <title>AI System Monitor Dashboard</title>
     <style>
         * {
             margin: 0;
@@ -36,6 +36,17 @@
             color: #F5B027;
             font-size: 28px;
             margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        /* Inline mark, sized off the heading so it scales with the font. */
+        .logo-mark {
+            width: 1em;
+            height: 1em;
+            flex: none;
+            display: block;
         }
 
         .subtitle {
@@ -277,7 +288,7 @@
 <body>
     <div class="container">
         <header>
-            <h1>🤖 AI System Health Dashboard</h1>
+            <h1>{% include '_logo.html' %} AI System Monitor Dashboard</h1>
             <p class="subtitle">Real-time monitoring for LLM API performance, cost tracking, and anomaly detection</p>
             <p class="subtitle" style="font-size: 12px; margin-top: 5px;">🕐 Times displayed in Egypt Time (UTC+3)</p>
         </header>

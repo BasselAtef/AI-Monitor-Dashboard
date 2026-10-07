@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI System Health Dashboard — LLM observability</title>
+    <title>AI System Monitor Dashboard — LLM observability</title>
     <meta name="description" content="Track token usage, latency, cost, and failures across Groq, OpenAI, Gemini, and Ollama. Drop-in wrapper, anomaly detection, per-project costs.">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -50,7 +50,12 @@
             text-decoration: none;
         }
 
-        .brand span:first-child { font-size: 22px; }
+        .brand .logo-mark {
+            width: 22px;
+            height: 22px;
+            flex: none;
+            display: block;
+        }
 
         .ghost-link {
             color: white;
@@ -223,8 +228,8 @@
     <div class="wrap">
         <header>
             <a class="brand" href="/">
-                <span>🤖</span>
-                <span>AI System Health</span>
+                {% include '_logo.html' %}
+                <span>AI System Monitor</span>
             </a>
             <a class="ghost-link" href="/login">Sign in →</a>
         </header>
@@ -276,7 +281,7 @@
             </div>
             <div class="card">
                 <div class="icon">⚖️</div>
-                <h3>A/B two providers</h3>
+                <h3>Local Ollama Support</h3>
                 <p>Run the same workload through Groq and a local Ollama model, then compare cost, latency, and failure rate side by side.</p>
             </div>
         </section>
@@ -304,7 +309,7 @@
 
     <footer>
         <div class="wrap foot-inner">
-            <span>AI System Health Dashboard</span>
+            <span>AI System Monitor Dashboard</span>
             <span>Built with Flask, SQLite, and Authlib · <a href="/login">Sign in</a></span>
         </div>
     </footer>
