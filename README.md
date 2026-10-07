@@ -146,14 +146,32 @@ All timestamps display in **Egypt time (UTC+3)**. Change `TZ_OFFSET_HOURS` in
 `app.py` to match your location. Stored values stay in UTC, so the time-range
 filters remain correct regardless of display offset.
 
+## Database
+
+Runs on SQLite locally and PostgreSQL in production, chosen automatically by
+whether `DATABASE_URL` is set. `db.py` holds the differences: placeholder style,
+schema dialect, the local-time expressions, and connection pooling.
+
+```bash
+# local: no DATABASE_URL, uses monitor.db
+python app.py
+
+# production
+export DATABASE_URL="postgresql://user:pass@host:5432/dbname"
+```
+
+PostgreSQL gets a bounded connection pool, since opening a connection per
+request would exhaust the database's connection limit under load.
+
 ## Known Limitations
 
-- **SQLite is ephemeral on most hosts.** The file lives on the container disk, so
-  a redeploy or restart clears logged history. Move to Postgres for persistence.
 - **No authentication.** Anyone with the URL can read all logs. Add auth before
   exposing this publicly.
 - **Redaction is a regex net, not a guarantee.** It covers the common credential
   shapes; an unusual error string could still slip something through.
+- **Migration is additive.** `init_db` creates missing tables and columns; it
+  does not move existing SQLite rows into PostgreSQL. Export and re-ingest if
+  you want your history.
 
 ## Why This Project?
 

@@ -12,19 +12,19 @@ from flask import Flask, render_template, jsonify, request, make_response
 from flask import session, redirect, url_for
 from flask_cors import CORS
 from datetime import datetime, timedelta, timezone
-import sqlite3
 import json
 import time
 import threading
 from collections import defaultdict
 import statistics
 
+import db
+from db import cursor, init_db, table_columns, local_time_sql, hour_bucket_sql
 from monitor_wrapper import build_wrapper
 from auth import (
     assert_configured,
     where_to_get_credentials,
     init_oauth,
-    init_users_table,
     is_local_host,
     oauth,
     get_or_create_user,
@@ -36,7 +36,9 @@ from auth import (
 
 # Timezone offset (Egypt/Alexandria = UTC+3)
 # Change this if you're in a different timezone
-TZ_OFFSET_HOURS = 3  # Egypt: UTC+3, adjust as needed
+TZ_OFFSET_HOURS = db.TZ_OFFSET_HOURS  # Egypt: UTC+3, adjust as needed
+
+init_db()
 
 def to_local_time(utc_timestamp_str):
     """Convert UTC timestamp string to local time"""
@@ -72,10 +74,6 @@ init_oauth(app)
 # cross-origin ingest token, so CORS stays scoped to that one route.
 CORS(app, resources={r"/api/log": {"origins": "*"}})
 
-# Database setup
-DB_PATH = "monitor.db"
-
-
 def current_user_id():
     """The signed-in user id, or None."""
     return session.get("user_id")
@@ -106,57 +104,10 @@ def token_from_request():
         return header.strip()
     return (request.args.get("token") or "").strip()
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS api_calls
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                  provider TEXT,
-                  model TEXT,
-                  prompt_tokens INTEGER,
-                  completion_tokens INTEGER,
-                  total_tokens INTEGER,
-                  latency_ms INTEGER,
-                  cost_usd REAL,
-                  status TEXT,
-                  error_message TEXT,
-                  user_id INTEGER)""")
-
-    c.execute("""CREATE TABLE IF NOT EXISTS anomalies
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                  anomaly_type TEXT,
-                  severity TEXT,
-                  description TEXT,
-                  call_id INTEGER,
-                  user_id INTEGER)""")
-
-    c.execute("""CREATE TABLE IF NOT EXISTS sessions
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 name TEXT,
-                 start_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-                 is_active INTEGER DEFAULT 1,
-                 user_id INTEGER)""")
-
-    # Databases created before multi-user support lack these columns; add them
-    # in place so existing rows survive. Their user_id stays NULL, which is
-    # never served to anyone.
-    for table in ("api_calls", "anomalies", "sessions"):
-        cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
-        if "user_id" not in cols:
-            c.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER")
-
-    c.execute("CREATE INDEX IF NOT EXISTS idx_calls_user ON api_calls(user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_anom_user ON anomalies(user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
-
-    conn.commit()
-    conn.close()
+# Schema creation and the local-time SQL live in db.py, which speaks both
+# SQLite and PostgreSQL.
 
 
-init_db()
-init_users_table(DB_PATH)
 # Cost calculation (per 1M tokens)
 COST_TABLE = {
     "groq/llama-3.1-70b": {"input": 0.59, "output": 0.79},
@@ -166,6 +117,19 @@ COST_TABLE = {
     "openai/gpt-4o": {"input": 2.50, "output": 10.00},
     "openai/gpt-4o-mini": {"input": 0.150, "output": 0.600},
 }
+
+def _format_ts(value):
+    """Render a timestamp as 'YYYY-MM-DD HH:MM:SS' for the JSON response.
+
+    SQLite hands back a string; PostgreSQL returns a real datetime, which
+    jsonify cannot serialise on its own.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
+
 
 def calculate_cost(provider, model, prompt_tokens, completion_tokens):
     """Cost in USD. Matches the full model id against the table by prefix, so
@@ -191,48 +155,43 @@ def calculate_cost(provider, model, prompt_tokens, completion_tokens):
 
 def detect_anomalies(call_id, latency_ms, cost_usd, provider, user_id):
     """Detect performance and cost anomalies"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Get recent calls for baseline (last 100 calls for same provider)
-    # Baseline is per user and per provider, so one tenant's traffic never
-    # skews another's thresholds.
-    c.execute('''SELECT latency_ms, cost_usd FROM api_calls 
-                 WHERE provider = ? AND status = 'success' AND user_id = ?
-                 ORDER BY timestamp DESC LIMIT 100''', (provider, user_id))
-    recent = c.fetchall()
-    
-    if len(recent) < 10:  # Need baseline data
-        conn.close()
-        return
-    
-    latencies = [r[0] for r in recent]
-    costs = [r[1] for r in recent]
-    
-    avg_latency = statistics.mean(latencies)
-    stdev_latency = statistics.stdev(latencies) if len(latencies) > 1 else 0
-    
-    avg_cost = statistics.mean(costs)
-    stdev_cost = statistics.stdev(costs) if len(costs) > 1 else 0
-    
-    # Latency spike detection (> 2 standard deviations)
-    if stdev_latency > 0 and latency_ms > avg_latency + (2 * stdev_latency):
-        c.execute('''INSERT INTO anomalies (anomaly_type, severity, description, call_id, user_id)
-                     VALUES (?, ?, ?, ?, ?)''',
-                  ("latency_spike", "warning", 
-                   f"Latency {latency_ms}ms is {round((latency_ms/avg_latency - 1) * 100)}% above baseline {round(avg_latency)}ms",
-                   call_id, user_id))
-    
-    # Cost spike detection
-    if stdev_cost > 0 and cost_usd > avg_cost + (2 * stdev_cost):
-        c.execute('''INSERT INTO anomalies (anomaly_type, severity, description, call_id, user_id)
-                     VALUES (?, ?, ?, ?, ?)''',
-                  ("cost_spike", "critical",
-                   f"Cost ${cost_usd} is {round((cost_usd/avg_cost - 1) * 100)}% above baseline ${round(avg_cost, 4)}",
-                   call_id, user_id))
-    
-    conn.commit()
-    conn.close()
+    with cursor() as c:
+        # Get recent calls for baseline (last 100 calls for same provider)
+        # Baseline is per user and per provider, so one tenant's traffic never
+        # skews another's thresholds.
+        c.execute('''SELECT latency_ms, cost_usd FROM api_calls
+                     WHERE provider = %s AND status = 'success' AND user_id = %s
+                     ORDER BY timestamp DESC, id DESC LIMIT 100''', (provider, user_id))
+        recent = c.fetchall()
+
+        if len(recent) < 10:  # Need baseline data
+            return
+
+        # cost_usd is Decimal on PostgreSQL; normalise before arithmetic.
+        latencies = [float(r["latency_ms"]) for r in recent]
+        costs = [float(r["cost_usd"]) for r in recent]
+
+        avg_latency = statistics.mean(latencies)
+        stdev_latency = statistics.stdev(latencies) if len(latencies) > 1 else 0
+
+        avg_cost = statistics.mean(costs)
+        stdev_cost = statistics.stdev(costs) if len(costs) > 1 else 0
+
+        # Latency spike detection (> 2 standard deviations)
+        if stdev_latency > 0 and latency_ms > avg_latency + (2 * stdev_latency):
+            c.execute('''INSERT INTO anomalies (anomaly_type, severity, description, call_id, user_id)
+                         VALUES (%s, %s, %s, %s, %s)''',
+                      ("latency_spike", "warning",
+                       f"Latency {latency_ms}ms is {round((latency_ms/avg_latency - 1) * 100)}% above baseline {round(avg_latency)}ms",
+                       call_id, user_id))
+
+        # Cost spike detection
+        if stdev_cost > 0 and float(cost_usd) > avg_cost + (2 * stdev_cost):
+            c.execute('''INSERT INTO anomalies (anomaly_type, severity, description, call_id, user_id)
+                         VALUES (%s, %s, %s, %s, %s)''',
+                      ("cost_spike", "critical",
+                       f"Cost ${cost_usd} is {round((float(cost_usd)/avg_cost - 1) * 100)}% above baseline ${round(avg_cost, 4)}",
+                       call_id, user_id))
 
 # --------------------------------------------------------------------------
 # auth routes
@@ -301,7 +260,7 @@ def google_callback():
         ), 400
 
     user_id, email, name, _, token_issued = get_or_create_user(
-        DB_PATH, info["sub"], info.get("email", ""),
+        info["sub"], info.get("email", ""),
         info.get("name", ""), info.get("picture", ""),
     )
     session["user_id"] = user_id
@@ -324,7 +283,7 @@ def logout():
 @login_required
 def account():
     uid = current_user_id()
-    row = get_user(DB_PATH, uid)
+    row = get_user(uid)
     return jsonify({
         "id": uid,
         "email": row["email"] if row else session.get("email"),
@@ -339,7 +298,7 @@ def account():
 @login_required
 def rotate_token():
     """Issue a new ingest token. The old one stops working immediately."""
-    token = rotate_ingest_token(DB_PATH, current_user_id())
+    token = rotate_ingest_token(current_user_id())
     return jsonify({"ingest_token": token})
 
 
@@ -350,7 +309,7 @@ def rotate_token():
 def log_api_call():
     """Record one LLM call. Authenticated by ingest token, since the caller is
     ai_monitor.py rather than a browser."""
-    user_id = user_for_token(DB_PATH, token_from_request())
+    user_id = user_for_token(token_from_request())
     if user_id is None:
         return jsonify({
             "success": False,
@@ -370,17 +329,15 @@ def log_api_call():
 
     cost_usd = calculate_cost(provider, model, prompt_tokens, completion_tokens)
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""INSERT INTO api_calls
-                 (provider, model, prompt_tokens, completion_tokens, total_tokens,
-                  latency_ms, cost_usd, status, error_message, user_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-              (provider, model, prompt_tokens, completion_tokens, total_tokens,
-               latency_ms, cost_usd, status, error_message, user_id))
-    call_id = c.lastrowid
-    conn.commit()
-    conn.close()
+    with cursor() as c:
+        c.execute("""INSERT INTO api_calls
+                     (provider, model, prompt_tokens, completion_tokens, total_tokens,
+                      latency_ms, cost_usd, status, error_message, user_id)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     RETURNING id""",
+                  (provider, model, prompt_tokens, completion_tokens, total_tokens,
+                   latency_ms, cost_usd, status, error_message, user_id))
+        call_id = c.fetchone()["id"]
 
     if status == 'success':
         threading.Thread(
@@ -408,73 +365,73 @@ def index():
 def get_stats():
     """Statistics for the signed-in user only."""
     uid = current_user_id()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
 
-    session_id = request.args.get('session_id', None)
-    if session_id:
-        c.execute('SELECT start_time FROM sessions WHERE id = ? AND user_id = ?',
-                  (session_id, uid))
-        result = c.fetchone()
-        cutoff = result[0] if result else datetime.utcnow() - timedelta(hours=24)
-    else:
-        hours = int(request.args.get('hours', 24))
-        cutoff = datetime.utcnow() - timedelta(hours=hours)
+    with cursor() as c:
+        session_id = request.args.get('session_id', None)
+        if session_id:
+            c.execute('SELECT start_time FROM sessions WHERE id = %s AND user_id = %s',
+                      (session_id, uid))
+            result = c.fetchone()
+            cutoff = result["start_time"] if result else datetime.utcnow() - timedelta(hours=24)
+        else:
+            hours = int(request.args.get('hours', 24))
+            cutoff = datetime.utcnow() - timedelta(hours=hours)
 
-    c.execute("""SELECT COUNT(*),
-                 SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END),
-                 SUM(total_tokens),
-                 SUM(cost_usd),
-                 AVG(latency_ms)
-                 FROM api_calls
-                 WHERE timestamp > ? AND user_id = ?""", (cutoff, uid))
+        c.execute("""SELECT COUNT(*) AS total_calls,
+                     SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successful,
+                     SUM(total_tokens) AS total_tokens,
+                     SUM(cost_usd) AS total_cost,
+                     AVG(latency_ms) AS avg_latency
+                     FROM api_calls
+                     WHERE timestamp > %s AND user_id = %s""", (cutoff, uid))
+        agg = c.fetchone() or {}
 
-    total_calls, successful, total_tokens, total_cost, avg_latency = c.fetchone()
-    total_calls = total_calls or 0
-    successful = successful or 0
-    total_tokens = total_tokens or 0
-    total_cost = total_cost or 0.0
-    avg_latency = avg_latency or 0
+        total_calls = agg.get("total_calls") or 0
+        successful = agg.get("successful") or 0
+        total_tokens = agg.get("total_tokens") or 0
+        total_cost = agg.get("total_cost") or 0.0
+        avg_latency = agg.get("avg_latency") or 0
 
-    success_rate = (successful / total_calls * 100) if total_calls > 0 else 100
+        success_rate = (successful / total_calls * 100) if total_calls > 0 else 100
 
-    c.execute("""SELECT provider, COUNT(*), SUM(cost_usd), AVG(latency_ms)
-                 FROM api_calls
-                 WHERE timestamp > ? AND status = 'success' AND user_id = ?
-                 GROUP BY provider""", (cutoff, uid))
+        c.execute("""SELECT provider, COUNT(*) AS calls, SUM(cost_usd) AS cost,
+                            AVG(latency_ms) AS avg_latency
+                     FROM api_calls
+                     WHERE timestamp > %s AND status = 'success' AND user_id = %s
+                     GROUP BY provider""", (cutoff, uid))
 
-    provider_stats = []
-    for row in c.fetchall():
-        provider_stats.append({
-            "provider": row[0],
-            "calls": row[1],
-            "cost": round(row[2] or 0, 4),
-            "avg_latency_ms": round(row[3] or 0, 1)
-        })
+        provider_stats = []
+        for row in c.fetchall():
+            provider_stats.append({
+                "provider": row["provider"],
+                "calls": row["calls"],
+                "cost": round(float(row["cost"] or 0), 4),
+                "avg_latency_ms": round(float(row["avg_latency"] or 0), 1)
+            })
 
-    c.execute("""SELECT datetime(timestamp, ?) as local_time, anomaly_type, severity, description
-                 FROM anomalies
-                 WHERE user_id = ?
-                 ORDER BY timestamp DESC LIMIT 10""", (f"+{TZ_OFFSET_HOURS} hours", uid))
+        c.execute(f"""SELECT {local_time_sql('timestamp')} AS local_time,
+                             anomaly_type, severity, description
+                      FROM anomalies
+                      WHERE user_id = %s
+                      ORDER BY timestamp DESC, id DESC LIMIT 10""", (uid,))
 
-    anomalies = []
-    for row in c.fetchall():
-        anomalies.append({
-            "timestamp": row[0],
-            "type": row[1],
-            "severity": row[2],
-            "description": row[3]
-        })
+        anomalies = []
+        for row in c.fetchall():
+            anomalies.append({
+                "timestamp": _format_ts(row["local_time"]),
+                "type": row["anomaly_type"],
+                "severity": row["severity"],
+                "description": row["description"]
+            })
 
-    c.execute("""SELECT strftime('%Y-%m-%d %H:00:00', timestamp) as hour,
-                 COUNT(*) as count
-                 FROM api_calls
-                 WHERE timestamp > ? AND user_id = ?
-                 GROUP BY hour
-                 ORDER BY hour""", (cutoff, uid))
+        bucket = hour_bucket_sql('timestamp')
+        c.execute(f"""SELECT {bucket} AS hour, COUNT(*) AS count
+                      FROM api_calls
+                      WHERE timestamp > %s AND user_id = %s
+                      GROUP BY hour
+                      ORDER BY hour""", (cutoff, uid))
 
-    hourly_volume = [{"hour": row[0], "count": row[1]} for row in c.fetchall()]
-    conn.close()
+        hourly_volume = [{"hour": row["hour"], "count": row["count"]} for row in c.fetchall()]
 
     return jsonify({
         "total_calls": total_calls,
@@ -495,28 +452,29 @@ def get_recent_calls():
     uid = current_user_id()
     limit = int(request.args.get('limit', 50))
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(f"""SELECT datetime(timestamp, '+{TZ_OFFSET_HOURS} hours'), provider, model,
-                         total_tokens, latency_ms, cost_usd, status, error_message
-                 FROM api_calls
-                 WHERE user_id = ?
-                 ORDER BY timestamp DESC LIMIT ?""", (uid, limit))
+    conn_local = local_time_sql('timestamp')
+    with cursor() as c:
+        # id breaks ties: SQLite timestamps have second precision, so several
+        # rows written in the same second otherwise sort unpredictably.
+        c.execute(f"""SELECT {conn_local} AS local_time, provider, model,
+                             total_tokens, latency_ms, cost_usd, status, error_message
+                      FROM api_calls
+                      WHERE user_id = %s
+                      ORDER BY timestamp DESC, id DESC LIMIT %s""", (uid, limit))
 
-    calls = []
-    for row in c.fetchall():
-        calls.append({
-            "timestamp": row[0],
-            "provider": row[1],
-            "model": row[2],
-            "tokens": row[3],
-            "latency_ms": row[4],
-            "cost_usd": round(row[5], 8),
-            "status": row[6],
-            "error": row[7]
-        })
+        calls = []
+        for row in c.fetchall():
+            calls.append({
+                "timestamp": _format_ts(row["local_time"]),
+                "provider": row["provider"],
+                "model": row["model"],
+                "tokens": row["total_tokens"],
+                "latency_ms": row["latency_ms"],
+                "cost_usd": round(float(row["cost_usd"] or 0), 8),
+                "status": row["status"],
+                "error": row["error_message"]
+            })
 
-    conn.close()
     return jsonify(calls)
 
 
@@ -542,18 +500,15 @@ def simulate_traffic():
         latency_ms = random.randint(200, 5000)
         status = "success" if random.random() > 0.05 else "error"
 
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("""INSERT INTO api_calls
-                     (provider, model, prompt_tokens, completion_tokens, total_tokens,
-                      latency_ms, cost_usd, status, error_message, user_id)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                  (provider, model, prompt_tokens, completion_tokens,
-                   prompt_tokens + completion_tokens, latency_ms,
-                   calculate_cost(provider, model, prompt_tokens, completion_tokens),
-                   status, "Timeout" if status == "error" else None, uid))
-        conn.commit()
-        conn.close()
+        with cursor() as c:
+            c.execute("""INSERT INTO api_calls
+                         (provider, model, prompt_tokens, completion_tokens, total_tokens,
+                          latency_ms, cost_usd, status, error_message, user_id)
+                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                      (provider, model, prompt_tokens, completion_tokens,
+                       prompt_tokens + completion_tokens, latency_ms,
+                       calculate_cost(provider, model, prompt_tokens, completion_tokens),
+                       status, "Timeout" if status == "error" else None, uid))
         generated += 1
 
     return jsonify({"success": True, "generated": generated})
@@ -570,20 +525,20 @@ def start_session():
     data = request.json or {}
     session_name = data.get('name', f"Session {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}")
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('UPDATE sessions SET is_active = 0 WHERE user_id = ?', (uid,))
-    c.execute('INSERT INTO sessions (name, start_time, user_id) VALUES (?, ?, ?)',
-              (session_name, datetime.utcnow(), uid))
-    session_id = c.lastrowid
-    conn.commit()
-    conn.close()
+    started = datetime.utcnow()
+    with cursor() as c:
+        c.execute('UPDATE sessions SET is_active = %s WHERE user_id = %s',
+                  (False, uid))
+        c.execute("""INSERT INTO sessions (name, start_time, user_id)
+                     VALUES (%s, %s, %s) RETURNING id""",
+                  (session_name, started, uid))
+        session_id = c.fetchone()["id"]
 
     return jsonify({
         "success": True,
         "session_id": session_id,
         "name": session_name,
-        "start_time": datetime.utcnow().isoformat()
+        "start_time": started.isoformat()
     })
 
 
@@ -592,28 +547,29 @@ def start_session():
 def get_active_session():
     """This user's active session, if any."""
     uid = current_user_id()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(f"""SELECT id, name, datetime(start_time, '+{TZ_OFFSET_HOURS} hours')
-                 FROM sessions
-                 WHERE is_active = 1 AND user_id = ?
-                 ORDER BY start_time DESC LIMIT 1""", (uid,))
-    result = c.fetchone()
-    conn.close()
+    bucket = local_time_sql('start_time')
+    with cursor() as c:
+        c.execute(f"""SELECT id, name, {bucket} AS local_start
+                     FROM sessions
+                     WHERE is_active = %s AND user_id = %s
+                     ORDER BY start_time DESC, id DESC LIMIT 1""", (True, uid))
+        result = c.fetchone()
 
     if result:
-        return jsonify({"session_id": result[0], "name": result[1], "start_time": result[2]})
+        return jsonify({
+            "session_id": result["id"],
+            "name": result["name"],
+            "start_time": _format_ts(result["local_start"]),
+        })
     return jsonify({"session_id": None})
 
 
 @app.route('/api/sessions/stop', methods=['POST'])
 @login_required
 def stop_session():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('UPDATE sessions SET is_active = 0 WHERE user_id = ?', (current_user_id(),))
-    conn.commit()
-    conn.close()
+    with cursor() as c:
+        c.execute('UPDATE sessions SET is_active = %s WHERE user_id = %s',
+                  (False, current_user_id()))
     return jsonify({"success": True})
 
 
@@ -635,7 +591,7 @@ def add_project():
                    or data.get('monitor_url')
                    or request.host_url.rstrip('/'))
 
-    row = get_user(DB_PATH, uid)
+    row = get_user(uid)
     fresh_token = session.pop("new_ingest_token", None)
     ingest_token = fresh_token or request.args.get('token_preview') or ''
 

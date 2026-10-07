@@ -17,10 +17,11 @@ import hashlib
 import hmac
 import os
 import secrets
-import sqlite3
 from functools import wraps
 
 from authlib.integrations.flask_client import OAuth
+
+from db import cursor
 
 # Load .env for local development. Values already in the real environment win,
 # which is what production hosts set. Missing .env is not an error.
@@ -128,26 +129,6 @@ def init_oauth(app: "Flask"):  # noqa: F821
 
 
 # --------------------------------------------------------------------------
-# users table
-# --------------------------------------------------------------------------
-def init_users_table(db_path: str) -> None:
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS users (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               google_sub TEXT UNIQUE NOT NULL,
-               email TEXT NOT NULL,
-               name TEXT,
-               picture TEXT,
-               ingest_token_hash TEXT NOT NULL,
-               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-           )"""
-    )
-    conn.commit()
-    conn.close()
-
-
-# --------------------------------------------------------------------------
 # ingest tokens
 # --------------------------------------------------------------------------
 def hash_token(token: str) -> str:
@@ -159,45 +140,43 @@ def new_ingest_token() -> str:
     return "aim_" + secrets.token_urlsafe(32)
 
 
-def get_or_create_user(db_path: str, google_sub: str, email: str,
+def get_or_create_user(google_sub: str, email: str,
                        name: str = "", picture: str = "") -> tuple:
     """Return (user_id, email, name, picture, ingest_token).
 
     Returns an existing user unchanged, or creates one with a fresh token.
     The token is returned only on creation.
     """
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM users WHERE google_sub = ?", (google_sub,)
-    ).fetchone()
+    with cursor() as cur:
+        cur.execute(
+            "SELECT id, email, name, picture FROM users WHERE google_sub = %s",
+            (google_sub,),
+        )
+        row = cur.fetchone()
+        if row:
+            return (row["id"], row["email"], row["name"], row["picture"], None)
 
-    if row:
-        result = (row["id"], row["email"], row["name"], row["picture"], None)
-        conn.close()
-        return result
+        token = new_ingest_token()
+        cur.execute(
+            """INSERT INTO users (google_sub, email, name, picture, ingest_token_hash)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (google_sub, email, name, picture, hash_token(token)),
+        )
+        cur.execute("SELECT id FROM users WHERE google_sub = %s", (google_sub,))
+        created = cur.fetchone()
 
-    token = new_ingest_token()
-    conn.execute(
-        """INSERT INTO users
-               (google_sub, email, name, picture, ingest_token_hash)
-           VALUES (?, ?, ?, ?, ?)""",
-        (google_sub, email, name, picture, hash_token(token)),
-    )
-    conn.commit()
-    user_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    conn.close()
-    return (user_id, email, name, picture, token)
+    # google_sub is UNIQUE, so this row is the one just inserted.
+    return (created["id"], email, name, picture, token)
 
 
-def user_for_token(db_path: str, token: str):
+def user_for_token(token: str):
     """Resolve an ingest token to a user id, or None. Constant-time compare."""
     if not token:
         return None
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT id, ingest_token_hash FROM users").fetchall()
-    conn.close()
+
+    with cursor() as cur:
+        cur.execute("SELECT id, ingest_token_hash FROM users")
+        rows = cur.fetchall()
 
     target = hash_token(token)
     for row in rows:
@@ -206,26 +185,22 @@ def user_for_token(db_path: str, token: str):
     return None
 
 
-def get_user(db_path: str, user_id: int):
+def get_user(user_id: int):
     """Fetch a user by id, for displaying account info."""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT id, email, name, picture, created_at FROM users WHERE id = ?",
-        (user_id,),
-    ).fetchone()
-    conn.close()
-    return row
+    with cursor() as cur:
+        cur.execute(
+            "SELECT id, email, name, picture, created_at FROM users WHERE id = %s",
+            (user_id,),
+        )
+        return cur.fetchone()
 
 
-def rotate_ingest_token(db_path: str, user_id: int) -> str:
+def rotate_ingest_token(user_id: int) -> str:
     """Issue a new ingest token, invalidating the old one."""
     token = new_ingest_token()
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        "UPDATE users SET ingest_token_hash = ? WHERE id = ?",
-        (hash_token(token), user_id),
-    )
-    conn.commit()
-    conn.close()
+    with cursor() as cur:
+        cur.execute(
+            "UPDATE users SET ingest_token_hash = %s WHERE id = %s",
+            (hash_token(token), user_id),
+        )
     return token
