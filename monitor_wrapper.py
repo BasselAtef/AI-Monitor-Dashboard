@@ -15,10 +15,10 @@ WHAT THIS DOES
 
 SETUP
     1. Keep this file in the same folder as your app.
-    2. Point it at your dashboard (defaults to the published instance):
+    2. Your ingest token is already filled in below. If you commit this file to
+       git, override the token with an environment variable instead:
 
-        import os
-        os.environ["AI_MONITOR_URL"] = "https://your-dashboard.up.railway.app"
+        os.environ["AI_MONITOR_TOKEN"] = "aim_..."
 
     3. Swap your raw API call for the monitored version:
 
@@ -43,6 +43,10 @@ import requests
 
 # Base URL of your dashboard. Override with the AI_MONITOR_URL env var.
 MONITOR_URL = os.environ.get("AI_MONITOR_URL", "{monitor_url}").rstrip("/")
+
+# Your personal ingest token. Pre-filled when you downloaded this file.
+# Prefer the AI_MONITOR_TOKEN env var so the token is not committed to git.
+INGEST_TOKEN = os.environ.get("AI_MONITOR_TOKEN", "{ingest_token}").strip()
 LOG_ENDPOINT = f"{{MONITOR_URL}}/api/log"
 
 # Never let a slow or dead dashboard block an LLM call.
@@ -62,6 +66,29 @@ PRICING: Dict[str, Any] = {{
 }}
 
 PROVIDER_PREFIXES = ("groq", "gemini", "openai", "ollama", "anthropic", "mistral")
+
+
+LOG_HEADERS = {{"X-Ingest-Token": INGEST_TOKEN}} if INGEST_TOKEN else {{}}
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    return getattr(exc, "response", None) is not None and exc.response.status_code in (401, 403)
+
+
+def _warn_auth_once() -> None:
+    """Tell the user once if telemetry is being rejected, then stay quiet."""
+    global _AUTH_WARNED
+    if _AUTH_WARNED:
+        return
+    _AUTH_WARNED = True
+    print(
+        "[ai_monitor] Dashboard rejected the ingest token "
+        "(401). Sign in at your dashboard, copy the token from /api/account, "
+        "and set AI_MONITOR_TOKEN. LLM calls are unaffected."
+    )
+
+
+_AUTH_WARNED = False
 
 
 # --------------------------------------------------------------------------
@@ -144,8 +171,15 @@ def log_call(
         "status": status,
         "error_message": redact_secrets(error)[:500] or None,
     }}
+    if not INGEST_TOKEN:
+        # Nothing to authenticate with; fail quietly rather than spam 401s.
+        return
     try:
-        requests.post(LOG_ENDPOINT, json=payload, timeout=LOG_TIMEOUT_SECONDS)
+        response = requests.post(
+            LOG_ENDPOINT, json=payload, headers=LOG_HEADERS, timeout=LOG_TIMEOUT_SECONDS
+        )
+        if response.status_code in (401, 403):
+            _warn_auth_once()
     except Exception:
         # Monitoring is best-effort. A dead dashboard must not break the app.
         pass
@@ -319,12 +353,22 @@ def monitored_gemini_call(api_key: str, model: str = "gemini-1.5-flash",
 '''
 
 
-def build_wrapper(project_name: str = "my_project", monitor_url: str = "http://localhost:5000") -> str:
-    """Return the wrapper source, filled in for one project."""
+def build_wrapper(
+    project_name: str = "my_project",
+    monitor_url: str = "http://localhost:5000",
+    ingest_token: str = "",
+) -> str:
+    """Return the wrapper source, filled in for one project.
+
+    ingest_token is pre-filled so a first-time user can drop the file in and
+    have it work immediately. It stays overridable via the AI_MONITOR_TOKEN
+    environment variable, which is the better habit once the file is committed.
+    """
     from datetime import datetime
 
     return WRAPPER_TEMPLATE.format(
         project_name=project_name or "my_project",
         generated_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
         monitor_url=monitor_url.rstrip("/"),
+        ingest_token=ingest_token or "",
     )

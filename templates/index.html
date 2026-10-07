@@ -196,14 +196,29 @@
             margin-bottom: 20px;
         }
 
-        button {
+        /* Shared by <button> and <a>, so link-style buttons (Sign out)
+           match the real ones instead of falling back to browser defaults. */
+        button,
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
             padding: 12px 24px;
             border: none;
             border-radius: 8px;
+            font-family: inherit;
             font-size: 14px;
             font-weight: 600;
+            line-height: 1.2;
+            text-decoration: none;
             cursor: pointer;
             transition: all 0.3s;
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
         }
 
         .btn-primary {
@@ -211,7 +226,7 @@
             color: white;
         }
 
-        .btn-primary:hover {
+        .btn-primary:hover:not(:disabled) {
             background: #bf891e;
             transform: translateY(-2px);
             box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
@@ -222,7 +237,7 @@
             color: #333;
         }
 
-        .btn-secondary:hover {
+        .btn-secondary:hover:not(:disabled) {
             background: #e9ecef;
         }
 
@@ -272,11 +287,35 @@
             <button class="btn-secondary" onclick="simulateTraffic()">⚡ Generate Sample Data</button>
             <button class="btn-secondary" id="sessionBtn" onclick="toggleSession()">🎯 Start New Session</button>
             <button class="btn-secondary" onclick="showAddProjectModal()">📁 Add Project</button>
+            <button class="btn-secondary" onclick="showAccountPanel()">🔑 My Account</button>
             <select id="timeRange" onchange="handleTimeRangeChange()" style="padding: 12px; border-radius: 8px; border: 1px solid #ddd;">
                 <option value="1">Last 1 hour</option>
                 <option value="24" selected>Last 24 hours</option>
                 <option value="168">Last 7 days</option>
             </select>
+            <a class="btn-secondary" href="/logout">Sign out</a>
+        </div>
+
+        <!-- Account panel -->
+        <div id="accountPanel" style="display: none; background: white; padding: 24px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px;">
+                <div>
+                    <h2 style="margin-top: 0; font-size: 18px; color: #333;">🔑 Ingest token</h2>
+                    <p style="color: #666; font-size: 13px; margin: 6px 0 14px 0; max-width: 520px; line-height: 1.6;">
+                        Your projects authenticate to the telemetry endpoint with this token.
+                        It is shown once at sign-up; keep it in the
+                        <code>AI_MONITOR_TOKEN</code> environment variable rather than
+                        hardcoding it, so it never lands in git.
+                    </p>
+                    <code id="tokenDisplay" style="display: block; background: #f5f5f5; padding: 12px; border-radius: 6px; word-break: break-all; font-size: 13px; margin-bottom: 12px;">loading…</code>
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                        <button class="btn-primary" onclick="copyToken()">Copy token</button>
+                        <button class="btn-secondary" onclick="rotateToken()">Rotate token</button>
+                        <span id="tokenNote" style="align-self: center; font-size: 12px; color: #888;"></span>
+                    </div>
+                </div>
+                <div id="accountIdentity" style="text-align: right; font-size: 13px; color: #666;"></div>
+            </div>
         </div>
 
         <div id="sessionInfo" style="display: none; background: #e8f5e9; padding: 12px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #4caf50;">
@@ -602,7 +641,68 @@ result = monitored_groq_call(
             }
         }
         
-        // Initial load and auto-refresh every 10 seconds
+        // --- account / ingest token ---
+let cachedToken = null;
+
+async function showAccountPanel() {
+    const panel = document.getElementById('accountPanel');
+    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    if (panel.style.display === 'none') return;
+
+    try {
+        const res = await fetch('/api/account');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+
+        if (data.ingest_token) {
+            cachedToken = data.ingest_token;
+            document.getElementById('tokenDisplay').textContent = data.ingest_token;
+            document.getElementById('tokenNote').textContent =
+                'New token shown once — save it now.';
+        } else if (!cachedToken) {
+            document.getElementById('tokenDisplay').textContent =
+                'Token already shown at sign-up. Rotate it if you lost it.';
+            document.getElementById('tokenNote').textContent = '';
+        }
+
+        const who = [data.name, data.email].filter(Boolean).join(' • ');
+        document.getElementById('accountIdentity').textContent = who;
+    } catch (error) {
+        document.getElementById('tokenDisplay').textContent = 'Could not load account';
+    }
+}
+
+async function copyToken() {
+    if (!cachedToken) {
+        document.getElementById('tokenNote').textContent =
+            'No token in this session — rotate to get a new one.';
+        return;
+    }
+    try {
+        await navigator.clipboard.writeText(cachedToken);
+        document.getElementById('tokenNote').textContent = 'Copied.';
+    } catch {
+        document.getElementById('tokenNote').textContent =
+            'Select the text above to copy manually.';
+    }
+}
+
+async function rotateToken() {
+    if (!confirm('Rotate your ingest token? Any wrapper still using the old token will stop reporting.')) return;
+    try {
+        const res = await fetch('/api/account/token/rotate', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+        cachedToken = data.ingest_token;
+        document.getElementById('tokenDisplay').textContent = data.ingest_token;
+        document.getElementById('tokenNote').textContent =
+            'Rotated. Update AI_MONITOR_TOKEN in your projects.';
+    } catch (error) {
+        document.getElementById('tokenNote').textContent = 'Rotate failed: ' + error;
+    }
+}
+
+// Initial load and auto-refresh every 10 seconds
         checkActiveSession();
         refreshData();
         setInterval(() => {
