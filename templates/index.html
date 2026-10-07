@@ -349,7 +349,18 @@
                     <p id="monitorUrlDisplay" style="margin: 0 0 12px 0; font-size: 12px; color: #666; word-break: break-all;"></p>
                     <label style="display: block; margin-bottom: 5px; font-size: 13px;">Point at a different instance (optional)</label>
                     <input type="text" id="monitorUrlOverride" placeholder="https://your-dashboard.up.railway.app"
-                           style="width: 100%; padding: 9px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 13px;">
+                           style="width: 100%; padding: 9px; margin-bottom: 14px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 13px;">
+
+                    <label style="display: block; margin-bottom: 5px; font-size: 13px;">Ingest token</label>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="text" id="ingestTokenInput" placeholder="aim_..."
+                               style="flex: 1; padding: 9px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 13px;">
+                        <button class="btn-secondary" onclick="fetchTokenForModal()" style="flex: 0 0 auto; font-size: 13px;">Fetch</button>
+                    </div>
+                    <p style="margin: 8px 0 0 0; font-size: 12px; color: #666; line-height: 1.5;">
+                        From <strong>My Account</strong>. Tokens are shown once — if
+                        you've lost it, open My Account and rotate.
+                    </p>
                 </div>
 
                 <div style="display: flex; gap: 10px; margin-bottom: 20px;">
@@ -359,15 +370,20 @@
 
                 <div id="wrapperResult" style="display: none;">
                     <div style="background: #e8f5e9; padding: 15px; border-radius: 8px; border-left: 4px solid #4caf50;">
-                        <p style="font-weight: 600; margin: 0 0 8px 0;">✅ Downloaded</p>
+                        <p style="font-weight: 600; margin: 0 0 8px 0;">✅ Downloaded with your token</p>
                         <p style="font-size: 13px; margin: 0 0 12px 0;">Drop <code>ai_monitor.py</code> next to your app, then swap one call:</p>
-<pre style="background: #fff; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; margin: 0;">from ai_monitor import monitored_groq_call
+<pre style="background: #fff; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; margin: 0 0 12px 0;">from ai_monitor import monitored_groq_call
 
 result = monitored_groq_call(
     api_key=GROQ_KEY,
     model="llama-3.1-8b-instant",
     messages=[{"role": "user", "content": "Hello"}],
 )</pre>
+                        <p style="font-size: 12px; color: #666; margin: 0; line-height: 1.5;">
+                            The token is inside the file. If you commit it to git,
+                            set <code>AI_MONITOR_TOKEN</code> in the environment
+                            instead — the file reads that first.
+                        </p>
                     </div>
                 </div>
 
@@ -504,7 +520,25 @@ result = monitored_groq_call(
                 // Update stat cards
                 document.getElementById('totalCalls').textContent = stats.total_calls.toLocaleString();
                 document.getElementById('successRate').textContent = stats.success_rate;
-                document.getElementById('costValue').textContent = stats.total_cost.toFixed(4);
+                // A null cost means a model has no entry in the price table.
+                // Showing "$0.00" there would read as "free", which is wrong.
+                const costEl = document.getElementById('costValue');
+                if (stats.total_cost === null || stats.total_cost === undefined) {
+                    costEl.textContent = 'n/a';
+                    costEl.style.color = '#e17055';
+                    document.getElementById('totalCost').title =
+                        'Some models are not in the price table yet';
+                } else {
+                    costEl.textContent = stats.total_cost.toFixed(4);
+                    costEl.style.color = '';
+                    document.getElementById('totalCost').title = '';
+                }
+                if (stats.unpriced_models && stats.unpriced_models.length) {
+                    showUnpricedNotice(stats.unpriced_models);
+                } else {
+                    const n = document.getElementById('unpricedNotice');
+                    if (n) n.remove();
+                }
                 document.getElementById('avgLatency').textContent = Math.round(stats.avg_latency_ms);
                 document.getElementById('totalTokens').textContent = stats.total_tokens.toLocaleString();
                 
@@ -531,12 +565,12 @@ result = monitored_groq_call(
                 if (stats.provider_stats.length === 0) {
                     providerContainer.innerHTML = '<div class="empty-state">No data yet</div>';
                 } else {
-                    providerContainer.innerHTML = '<div class="provider-stats">' + 
+                    providerContainer.innerHTML = '<div class="provider-stats">' +
                         stats.provider_stats.map(p => `
                             <div class="provider-item">
                                 <div class="provider-name">${p.provider}</div>
                                 <div class="provider-metrics">
-                                    ${p.calls} calls • $${p.cost} • ${p.avg_latency_ms}ms avg
+                                    ${p.calls} calls • ${p.cost === null ? 'cost n/a' : '$' + p.cost} • ${p.avg_latency_ms}ms avg
                                 </div>
                             </div>
                         `).join('') + '</div>';
@@ -571,7 +605,7 @@ result = monitored_groq_call(
                                         <td>${call.model}</td>
                                         <td>${call.tokens.toLocaleString()}</td>
                                         <td>${call.latency_ms}ms</td>
-                                        <td>$${call.cost_usd.toFixed(4)}</td>
+                                        <td>${call.cost_usd === null ? '<span title="no price for this model">n/a</span>' : '$' + call.cost_usd.toFixed(4)}</td>
                                         <td class="status-${call.status}">${call.status}</td>
                                     </tr>
                                 `).join('')}
@@ -606,6 +640,11 @@ result = monitored_groq_call(
         function showAddProjectModal() {
             document.getElementById('monitorUrlDisplay').textContent = window.location.origin;
             document.getElementById('addProjectModal').style.display = 'flex';
+            if (cachedToken) {
+                document.getElementById('ingestTokenInput').value = cachedToken;
+            } else {
+                fetchTokenForModal();
+            }
         }
         
         function closeAddProjectModal() {
@@ -618,22 +657,52 @@ result = monitored_groq_call(
             return override || window.location.origin;
         }
         
+        async function fetchTokenForModal() {
+            const input = document.getElementById('ingestTokenInput');
+            try {
+                const res = await fetch('/api/account');
+                const data = await res.json();
+                if (data.ingest_token) {
+                    cachedToken = data.ingest_token;
+                    input.value = data.ingest_token;
+                    input.type = 'text';
+                } else {
+                    input.value = '';
+                    alert('No token available in this session. Open My Account and click "Rotate token" to issue a new one, then paste it here.');
+                }
+            } catch (error) {
+                alert('Could not load your token: ' + error);
+            }
+        }
+
         async function downloadWrapper() {
             const projectName = document.getElementById('projectName').value.trim() || 'my_project';
+            const token = document.getElementById('ingestTokenInput').value.trim() || cachedToken || '';
             const btn = event.target;
             btn.disabled = true;
             btn.textContent = '⏳ Preparing...';
-            
+
+            if (!token) {
+                btn.disabled = false;
+                btn.textContent = '⬇️ Download ai_monitor.py';
+                alert('An ingest token is required — without it the wrapper silently reports nothing.\n\nClick Fetch, or open My Account and rotate the token.');
+                return;
+            }
+
             try {
                 const targetUrl = currentMonitorUrl();
                 const res = await fetch('/api/projects/add?monitor_url=' + encodeURIComponent(targetUrl), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ project_name: projectName, mode: 'download' })
+                    body: JSON.stringify({ project_name: projectName, ingest_token: token })
                 });
-                
-                if (!res.ok) throw new Error('HTTP ' + res.status);
-                
+
+                if (!res.ok) {
+                    let msg = 'HTTP ' + res.status;
+                    try { msg = (await res.json()).error || msg; } catch (e) { /* keep default */ }
+                    throw new Error(msg);
+                }
+
                 const blob = await res.blob();
                 const link = document.createElement('a');
                 link.href = URL.createObjectURL(blob);
@@ -642,7 +711,7 @@ result = monitored_groq_call(
                 link.click();
                 link.remove();
                 URL.revokeObjectURL(link.href);
-                
+
                 document.getElementById('wrapperResult').style.display = 'block';
             } catch (error) {
                 alert('Download failed: ' + error.message);
@@ -654,6 +723,21 @@ result = monitored_groq_call(
         
         // --- account / ingest token ---
 let cachedToken = null;
+
+function showUnpricedNotice(models) {
+    let box = document.getElementById('unpricedNotice');
+    if (!box) {
+        box = document.createElement('div');
+        box.id = 'unpricedNotice';
+        box.style.cssText = 'background:#fff8e6;padding:14px;border-radius:8px;' +
+            'margin-bottom:20px;border-left:4px solid #F5B027;font-size:13px;color:#6b5416;';
+        document.querySelector('.container').insertBefore(box, document.querySelector('.stats-grid'));
+    }
+    box.innerHTML = '<strong>Cost not calculated for:</strong> ' + models.join(', ') +
+        '<br>These models are not in the price table yet, so they are excluded ' +
+        'from the total rather than counted as free. Add them to <code>COST_TABLE</code> ' +
+        'in <code>app.py</code>.';
+}
 
 async function showAccountPanel() {
     const panel = document.getElementById('accountPanel');

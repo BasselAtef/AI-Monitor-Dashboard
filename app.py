@@ -116,6 +116,8 @@ COST_TABLE = {
     "gemini/gemini-1.5-pro": {"input": 0.35, "output": 1.05},
     "openai/gpt-4o": {"input": 2.50, "output": 10.00},
     "openai/gpt-4o-mini": {"input": 0.150, "output": 0.600},
+    # Local inference is free; listed so it is distinguished from "unknown".
+    "ollama/*": {"input": 0.0, "output": 0.0},
 }
 
 def _format_ts(value):
@@ -131,24 +133,45 @@ def _format_ts(value):
     return str(value)
 
 
-def calculate_cost(provider, model, prompt_tokens, completion_tokens):
-    """Cost in USD. Matches the full model id against the table by prefix, so
-    real ids like 'llama-3.1-8b-instant' resolve to 'groq/llama-3.1-8b'."""
+def price_for(provider, model):
+    """Resolve a rate table, or None when the model is not priced.
+
+    Matching is by longest prefix, so 'gpt-4o' is not swallowed by the
+    'gpt-4o-mini' row and 'llama-3.1-8b-instant' resolves to the 8b row.
+    """
     provider = (provider or "").lower()
     model = (model or "").lower()
 
-    rates = None
+    best = None
     for key, value in COST_TABLE.items():
         prefix, wanted = key.split("/", 1)
-        if prefix == provider and model.startswith(wanted):
-            # Longest match wins, so gpt-4o does not swallow gpt-4o-mini.
-            if rates is None or len(wanted) > len(rates[0]):
-                rates = (wanted, value)
+        if prefix != provider:
+            continue
+        # A trailing '*' is a catch-all for that provider, e.g. 'ollama/*'.
+        if wanted.endswith("*"):
+            matches = bool(model)
+        else:
+            matches = model.startswith(wanted)
+        if not matches:
+            continue
+        # Longest literal match wins, so gpt-4o beats gpt-4o-mini and a
+        # catch-all never shadows a specific entry.
+        weight = 0 if wanted.endswith("*") else len(wanted)
+        if best is None or weight > best[0]:
+            best = (weight, value)
+    return best[1] if best else None
 
-    if rates is None:
-        return 0.0
 
-    table = rates[1]
+def calculate_cost(provider, model, prompt_tokens, completion_tokens):
+    """Cost in USD, or None when the model has no entry in COST_TABLE.
+
+    None matters: returning 0.0 for an unpriced model makes a real bill look
+    free. Callers surface the difference instead of quietly reporting zero.
+    """
+    table = price_for(provider, model)
+    if table is None:
+        return None
+
     input_cost = (prompt_tokens / 1_000_000) * table["input"]
     output_cost = (completion_tokens / 1_000_000) * table["output"]
     return round(input_cost + output_cost, 8)
@@ -169,12 +192,12 @@ def detect_anomalies(call_id, latency_ms, cost_usd, provider, user_id):
 
         # cost_usd is Decimal on PostgreSQL; normalise before arithmetic.
         latencies = [float(r["latency_ms"]) for r in recent]
-        costs = [float(r["cost_usd"]) for r in recent]
+        costs = [float(r["cost_usd"]) for r in recent if r["cost_usd"] is not None]
 
         avg_latency = statistics.mean(latencies)
         stdev_latency = statistics.stdev(latencies) if len(latencies) > 1 else 0
 
-        avg_cost = statistics.mean(costs)
+        avg_cost = statistics.mean(costs) if costs else 0
         stdev_cost = statistics.stdev(costs) if len(costs) > 1 else 0
 
         # Latency spike detection (> 2 standard deviations)
@@ -185,8 +208,9 @@ def detect_anomalies(call_id, latency_ms, cost_usd, provider, user_id):
                        f"Latency {latency_ms}ms is {round((latency_ms/avg_latency - 1) * 100)}% above baseline {round(avg_latency)}ms",
                        call_id, user_id))
 
-        # Cost spike detection
-        if stdev_cost > 0 and float(cost_usd) > avg_cost + (2 * stdev_cost):
+        # Cost spike detection. Skip when this call has no priced rate, so an
+        # unpriced model does not trigger a spike against a priced baseline.
+        if cost_usd is not None and stdev_cost > 0 and float(cost_usd) > avg_cost + (2 * stdev_cost):
             c.execute('''INSERT INTO anomalies (anomaly_type, severity, description, call_id, user_id)
                          VALUES (%s, %s, %s, %s, %s)''',
                       ("cost_spike", "critical",
@@ -395,19 +419,34 @@ def get_stats():
         success_rate = (successful / total_calls * 100) if total_calls > 0 else 100
 
         c.execute("""SELECT provider, COUNT(*) AS calls, SUM(cost_usd) AS cost,
-                            AVG(latency_ms) AS avg_latency
+                            AVG(latency_ms) AS avg_latency,
+                            SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END) AS unpriced
                      FROM api_calls
                      WHERE timestamp > %s AND status = 'success' AND user_id = %s
                      GROUP BY provider""", (cutoff, uid))
 
         provider_stats = []
         for row in c.fetchall():
+            calls = row["calls"] or 0
+            unpriced = row["unpriced"] or 0
+            # Cost is per model, so a provider group can hold both priced and
+            # unpriced calls. Any unpriced call makes this group's total
+            # incomplete, so report n/a rather than a subtotal that looks whole.
+            # float() also normalises PostgreSQL's Decimal.
+            cost = None if unpriced else round(float(row["cost"] or 0), 4)
             provider_stats.append({
                 "provider": row["provider"],
-                "calls": row["calls"],
-                "cost": round(float(row["cost"] or 0), 4),
-                "avg_latency_ms": round(float(row["avg_latency"] or 0), 1)
+                "calls": calls,
+                "cost": cost,
+                "avg_latency_ms": round(float(row["avg_latency"] or 0), 1),
+                "unpriced_calls": unpriced,
             })
+
+        # Named separately from provider_stats, which groups by provider.
+        c.execute("""SELECT DISTINCT provider, model FROM api_calls
+                     WHERE timestamp > %s AND user_id = %s AND cost_usd IS NULL
+                     LIMIT 10""", (cutoff, uid))
+        unpriced_models = [f"{r['provider']}/{r['model']}" for r in c.fetchall()]
 
         c.execute(f"""SELECT {local_time_sql('timestamp')} AS local_time,
                              anomaly_type, severity, description
@@ -433,13 +472,19 @@ def get_stats():
 
         hourly_volume = [{"hour": row["hour"], "count": row["count"]} for row in c.fetchall()]
 
+    # The total is only meaningful when every call in the window is priced.
+    total_cost = None if unpriced_models else round(float(total_cost or 0), 4)
+
     return jsonify({
         "total_calls": total_calls,
         "success_rate": round(success_rate, 2),
         "total_tokens": total_tokens,
-        "total_cost": round(total_cost, 4),
+        # PostgreSQL NUMERIC arrives as Decimal, which jsonify renders as a string.
+        # Coerce to float so the API contract is numeric on both backends.
+        "total_cost": total_cost,
         "avg_latency_ms": round(avg_latency, 1),
         "provider_stats": provider_stats,
+        "unpriced_models": unpriced_models,
         "anomalies": anomalies,
         "hourly_volume": hourly_volume
     })
@@ -470,7 +515,8 @@ def get_recent_calls():
                 "model": row["model"],
                 "tokens": row["total_tokens"],
                 "latency_ms": row["latency_ms"],
-                "cost_usd": round(float(row["cost_usd"] or 0), 8),
+                "cost_usd": (None if row["cost_usd"] is None
+                            else round(float(row["cost_usd"]), 8)),
                 "status": row["status"],
                 "error": row["error_message"]
             })
@@ -591,15 +637,26 @@ def add_project():
                    or data.get('monitor_url')
                    or request.host_url.rstrip('/'))
 
-    row = get_user(uid)
+    # Token sources, in order: freshly issued this session, then one the caller
+    # pasted in. Refuse to emit a wrapper that cannot authenticate, since an
+    # empty INGEST_TOKEN makes the file silently inert.
     fresh_token = session.pop("new_ingest_token", None)
-    ingest_token = fresh_token or request.args.get('token_preview') or ''
+    supplied = (data.get('ingest_token') or '').strip()
+    ingest_token = fresh_token or supplied
+
+    if not ingest_token:
+        return jsonify({
+            'success': False,
+            'error': 'No ingest token. Copy it from My Account (or rotate it '
+                     'for a fresh one) and paste it here.',
+        }), 400
 
     source = build_wrapper(project_name, monitor_url, ingest_token)
 
     response = make_response(source)
     response.headers['Content-Type'] = 'text/x-python; charset=utf-8'
     response.headers['Content-Disposition'] = 'attachment; filename=ai_monitor.py'
+    response.headers['X-Ingest-Token-Embedded'] = 'true'
     return response
 
 
