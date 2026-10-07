@@ -25,10 +25,22 @@ than the placeholder syntax and are easy to get subtly wrong.
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-TZ_OFFSET_HOURS = 3
+TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))
+
+# Connection pool size. Keep this at or below the Postgres connection limit
+# your host allows minus whatever else uses that database; a pool larger than
+# the server limit shows up as "too many connections" at deploy time.
+# Railway trial plans allow very few, so this is usually lowered there.
+POOL_MIN = int(os.environ.get("DB_POOL_MIN", "1"))
+POOL_MAX = int(os.environ.get("DB_POOL_MAX", "10"))
+
+# Startup waits, kept short so a slow database cannot stall the boot for long.
+POOL_WAIT_SECONDS = float(os.environ.get("DB_POOL_WAIT", "15"))
+POOL_CLOSE_TIMEOUT = float(os.environ.get("DB_POOL_CLOSE", "5"))
 
 _pool = None
 _pool_lock = threading.Lock()
@@ -75,23 +87,37 @@ def get_pool():
             if _pool is None:
                 from psycopg_pool import ConnectionPool
 
-                _pool = ConnectionPool(
+                candidate = ConnectionPool(
                     DATABASE_URL,
-                    min_size=1,
-                    max_size=10,
+                    min_size=POOL_MIN,
+                    max_size=POOL_MAX,
                     timeout=10,
                     kwargs={"autocommit": False},
                     open=True,
                 )
-                _pool.wait(timeout=15)
+                try:
+                    candidate.wait(timeout=POOL_WAIT_SECONDS)
+                except Exception:
+                    # Never publish a pool that did not come up, or every
+                    # later attempt would reuse it and fail identically.
+                    try:
+                        candidate.close(timeout=1)
+                    except Exception:
+                        pass
+                    raise
+                _pool = candidate
     return _pool
 
 
 def close_pool():
+    """Drop the pool. Bounded wait so shutdown cannot hang on a stuck worker."""
     global _pool
-    if _pool is not None:
-        _pool.close()
-        _pool = None
+    pool, _pool = _pool, None
+    if pool is not None:
+        try:
+            pool.close(timeout=POOL_CLOSE_TIMEOUT)
+        except Exception:
+            pass
 
 
 class Cursor:
@@ -263,13 +289,66 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 """
 
 
-def init_db() -> None:
-    """Create tables and indexes if they are missing."""
+def init_db(retries: int = 5, delay: float = 2.0) -> None:
+    """Create tables and indexes if they are missing.
+
+    Runs at import, so on a fresh deploy the database may still be starting.
+    Retry briefly rather than dying with a pool timeout that says nothing about
+    the actual cause.
+    """
     schema = SCHEMA_POSTGRES if using_postgres() else SCHEMA_SQLITE
-    with cursor() as cur:
-        for statement in schema.split(";"):
-            if statement.strip():
-                cur.execute(statement)
+    statements = [s for s in schema.split(";") if s.strip()]
+
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            with cursor() as cur:
+                for statement in statements:
+                    cur.execute(statement)
+            return
+        except Exception as exc:
+            last_error = exc
+            # A schema error will not fix itself; only retry connection trouble.
+            if using_postgres() and attempt < retries:
+                print(
+                    f"[db] schema init attempt {attempt}/{retries} failed "
+                    f"({type(exc).__name__}); retrying in {delay}s",
+                    flush=True,
+                )
+                # Discard the pool. A pool that failed to open is left closed,
+                # and reusing it would make every later attempt fail the same
+                # way instead of reconnecting.
+                close_pool()
+                time.sleep(delay)
+
+    raise SystemExit(
+        "Cannot start: could not prepare the database schema.\n"
+        f"  backend : {'PostgreSQL' if using_postgres() else 'SQLite'}\n"
+        f"  url     : {_redacted_url()}\n"
+        f"  error   : {type(last_error).__name__}: {last_error}\n\n"
+        + (
+            "If the database is still starting, the deploy will retry on the\n"
+            "next restart. Check that DATABASE_URL is correct and that the\n"
+            "Postgres plugin is attached to this service.\n"
+            if using_postgres()
+            else "Check that the directory is writable.\n"
+        )
+    ) from last_error
+
+
+def _redacted_url() -> str:
+    """DATABASE_URL with any password masked, safe to log."""
+    if not DATABASE_URL:
+        return "(unset)"
+    try:
+        scheme, _, rest = DATABASE_URL.partition("://")
+        if "@" in rest:
+            creds, _, host = rest.partition("@")
+            user, _, _pw = creds.partition(":")
+            rest = f"{user}:***@{host}"
+        return f"{scheme}://{rest}"
+    except Exception:
+        return "(unparseable)"
 
 
 def table_columns(table: str) -> set:
