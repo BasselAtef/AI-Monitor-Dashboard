@@ -95,6 +95,7 @@ Real provider errors still raise, so your own error handling sees them.
 ## Anomaly Detection
 
 The system automatically detects:
+
 - **Latency Spikes**: Calls >2 standard deviations above baseline
 - **Cost Spikes**: Calls >2 standard deviations above baseline cost
 
@@ -103,9 +104,11 @@ Requires at least 10 baseline calls per provider for statistical accuracy.
 ## Deployment
 
 ### Local Development
+
 Already running! Just use `python app.py`.
 
 ### Production (Railway/Render)
+
 1. Add `Procfile`:
    ```
    web: gunicorn app:app
@@ -114,6 +117,7 @@ Already running! Just use `python app.py`.
 3. Deploy to Railway or Render (free tier available)
 
 ### Docker
+
 ```dockerfile
 FROM python:3.11-slim
 WORKDIR /app
@@ -131,14 +135,27 @@ Prices per 1M tokens. Model ids are matched by longest prefix, so
 get swallowed by `gpt-4o-mini`. These are local estimates for reporting, not
 charges — the dashboard never calls a provider.
 
-| Provider/Model | Input | Output |
-|----------------|-------|--------|
-| Groq Llama 3.1 70B | $0.59 | $0.79 |
-| Groq Llama 3.1 8B | $0.05 | $0.08 |
-| Gemini 1.5 Flash | $0.075 | $0.30 |
-| Gemini 1.5 Pro | $0.35 | $1.05 |
-| OpenAI GPT-4o | $2.50 | $10.00 |
-| OpenAI GPT-4o Mini | $0.15 | $0.60 |
+| Provider/Model              | Input  | Output  |
+| --------------------------- | ------ | ------- |
+| Gemini 3.8 Flash            | $0.75  | $3.75   |
+| Gemini 2.0 Flash            | $0.10  | $0.40   |
+| Gemini 2.0 Pro              | $0.50  | $1.50   |
+| Gemini 1.5 Flash            | $0.075 | $0.30   |
+| Gemini 1.5 Pro              | $0.35  | $1.05   |
+| OpenAI GPT-4o               | $2.50  | $10.00  |
+| OpenAI GPT-4o Mini          | $0.15  | $0.60   |
+| OpenAI GPT-4.5              | $75.00 | $150.00 |
+| OpenAI o1                   | $15.00 | $60.00  |
+| OpenAI o3-mini              | $1.10  | $4.40   |
+| Anthropic Claude 3.5 Sonnet | $3.00  | $15.00  |
+| Anthropic Claude 3.5 Haiku  | $0.80  | $4.00   |
+| DeepSeek V3                 | $0.14  | $0.28   |
+| DeepSeek R1                 | $0.55  | $2.19   |
+| Groq Llama 3.3 70B          | $0.59  | $0.79   |
+| Groq Llama 3.1 70B          | $0.59  | $0.79   |
+| Groq Llama 3.1 8B           | $0.05  | $0.08   |
+| Mistral Large               | $2.00  | $6.00   |
+| Qwen 3.8                    | $0.80  | $4.00   |
 
 ## Timezone
 
@@ -176,6 +193,7 @@ request would exhaust the database's connection limit under load.
 ## Why This Project?
 
 Built to demonstrate production AI monitoring skills for junior AI engineer roles:
+
 - Shows understanding of LLM API costs and optimization
 - Demonstrates production observability practices
 - Proves ability to build full-stack AI tooling

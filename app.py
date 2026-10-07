@@ -110,12 +110,34 @@ def token_from_request():
 
 # Cost calculation (per 1M tokens)
 COST_TABLE = {
+    # Groq
+    "groq/llama-3.3-70b": {"input": 0.59, "output": 0.79},
     "groq/llama-3.1-70b": {"input": 0.59, "output": 0.79},
     "groq/llama-3.1-8b": {"input": 0.05, "output": 0.08},
+    "groq/mixtral-8x7b": {"input": 0.24, "output": 0.24},
+    "groq/qwen3.8-27b": {"input": 0.80, "output": 4.00},
+    # Gemini
+    "gemini/gemini-3.8-flash": {"input": 0.75, "output": 3.75},
+    "gemini/gemini-2.0-flash": {"input": 0.10, "output": 0.40},
+    "gemini/gemini-2.0-pro": {"input": 0.50, "output": 1.50},
     "gemini/gemini-1.5-flash": {"input": 0.075, "output": 0.30},
     "gemini/gemini-1.5-pro": {"input": 0.35, "output": 1.05},
+    # OpenAI
     "openai/gpt-4o": {"input": 2.50, "output": 10.00},
     "openai/gpt-4o-mini": {"input": 0.150, "output": 0.600},
+    "openai/gpt-4.5": {"input": 75.00, "output": 150.00},
+    "openai/o1": {"input": 15.00, "output": 60.00},
+    "openai/o3-mini": {"input": 1.10, "output": 4.40},
+    # Anthropic
+    "anthropic/claude-3-5-sonnet": {"input": 3.00, "output": 15.00},
+    "anthropic/claude-3-5-haiku": {"input": 0.80, "output": 4.00},
+    "anthropic/claude-3-opus": {"input": 15.00, "output": 75.00},
+    # DeepSeek
+    "deepseek/deepseek-v3": {"input": 0.14, "output": 0.28},
+    "deepseek/deepseek-r1": {"input": 0.55, "output": 2.19},
+    # Mistral
+    "mistral/mistral-large": {"input": 2.00, "output": 6.00},
+    "mistral/mistral-small": {"input": 0.20, "output": 0.60},
     # Local inference is free; listed so it is distinguished from "unknown".
     "ollama/*": {"input": 0.0, "output": 0.0},
 }
@@ -138,27 +160,37 @@ def price_for(provider, model):
 
     Matching is by longest prefix, so 'gpt-4o' is not swallowed by the
     'gpt-4o-mini' row and 'llama-3.1-8b-instant' resolves to the 8b row.
+
+    Some providers namespace their ids ('qwen/qwen3.8-27b' on Groq), so the
+    segment after the last slash is tried as well. Without that, a table key
+    of 'groq/qwen3.8-27b' would never match, and the call would silently read
+    as unpriced.
     """
     provider = (provider or "").lower()
     model = (model or "").lower()
+
+    candidates = [model]
+    if "/" in model:
+        tail = model.rsplit("/", 1)[1]
+        if tail and tail != model:
+            candidates.append(tail)
 
     best = None
     for key, value in COST_TABLE.items():
         prefix, wanted = key.split("/", 1)
         if prefix != provider:
             continue
-        # A trailing '*' is a catch-all for that provider, e.g. 'ollama/*'.
-        if wanted.endswith("*"):
-            matches = bool(model)
-        else:
-            matches = model.startswith(wanted)
-        if not matches:
-            continue
+        wildcard = wanted.endswith("*")
         # Longest literal match wins, so gpt-4o beats gpt-4o-mini and a
         # catch-all never shadows a specific entry.
-        weight = 0 if wanted.endswith("*") else len(wanted)
-        if best is None or weight > best[0]:
-            best = (weight, value)
+        weight = 0 if wildcard else len(wanted)
+        for candidate in candidates:
+            if wildcard:
+                matched = bool(candidate)
+            else:
+                matched = candidate.startswith(wanted)
+            if matched and (best is None or weight > best[0]):
+                best = (weight, value)
     return best[1] if best else None
 
 
@@ -531,10 +563,16 @@ def simulate_traffic():
     import random
 
     providers = [
-        ("groq", "llama-3.1-70b"),
+        ("groq", "llama-3.3-70b"),
         ("groq", "llama-3.1-8b"),
+        ("gemini", "gemini-3.8-flash"),
+        ("gemini", "gemini-2.0-flash"),
         ("gemini", "gemini-1.5-flash"),
-        ("openai", "gpt-4o-mini")
+        ("openai", "gpt-4o"),
+        ("openai", "gpt-4o-mini"),
+        ("openai", "o3-mini"),
+        ("anthropic", "claude-3-5-sonnet"),
+        ("deepseek", "deepseek-r1"),
     ]
 
     uid = current_user_id()

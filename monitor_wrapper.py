@@ -57,15 +57,31 @@ CHARS_PER_TOKEN = 4
 
 # model id -> USD per 1M tokens: (input, output)
 PRICING: Dict[str, Any] = {{
+    "groq/llama-3.3-70b": (0.59, 0.79),
     "groq/llama-3.1-70b": (0.59, 0.79),
     "groq/llama-3.1-8b": (0.05, 0.08),
+    "groq/mixtral-8x7b": (0.24, 0.24),
+    "groq/qwen3.8-27b": (0.80, 4.00),
+    "gemini/gemini-3.8-flash": (0.75, 3.75),
+    "gemini/gemini-2.0-flash": (0.10, 0.40),
+    "gemini/gemini-2.0-pro": (0.50, 1.50),
     "gemini/gemini-1.5-flash": (0.075, 0.30),
     "gemini/gemini-1.5-pro": (0.35, 1.05),
     "openai/gpt-4o": (2.50, 10.00),
     "openai/gpt-4o-mini": (0.15, 0.60),
+    "openai/gpt-4.5": (75.00, 150.00),
+    "openai/o1": (15.00, 60.00),
+    "openai/o3-mini": (1.10, 4.40),
+    "anthropic/claude-3-5-sonnet": (3.00, 15.00),
+    "anthropic/claude-3-5-haiku": (0.80, 4.00),
+    "anthropic/claude-3-opus": (15.00, 75.00),
+    "deepseek/deepseek-v3": (0.14, 0.28),
+    "deepseek/deepseek-r1": (0.55, 2.19),
+    "mistral/mistral-large": (2.00, 6.00),
+    "mistral/mistral-small": (0.20, 0.60),
 }}
 
-PROVIDER_PREFIXES = ("groq", "gemini", "openai", "ollama", "anthropic", "mistral")
+PROVIDER_PREFIXES = ("groq", "gemini", "openai", "ollama", "anthropic", "mistral", "deepseek")
 
 
 LOG_HEADERS = {{"X-Ingest-Token": INGEST_TOKEN}} if INGEST_TOKEN else {{}}
