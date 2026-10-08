@@ -1,26 +1,49 @@
-# AI System Health Dashboard
+# AI System Monitor
 
-Real-time monitoring dashboard for LLM API calls with cost tracking, latency analysis, and anomaly detection.
+Real-time monitoring dashboard for LLM API calls with cost tracking, latency analysis, and anomaly detection. Multi-tenant, with Google sign-in.
 
 ## Features
 
 - **Real-time Performance Monitoring**: Track API call latency, token usage, and success rates
-- **Cost Tracking**: Automatic cost calculation for Groq, Gemini, and OpenAI models
+- **Cost Tracking**: Automatic cost calculation for six paid providers (Groq, Gemini, OpenAI, Anthropic, DeepSeek, Mistral), plus a free rate for local Ollama
 - **Anomaly Detection**: Statistical detection of latency spikes and cost anomalies (>2 standard deviations)
 - **Provider Breakdown**: Compare performance and costs across different LLM providers
-- **Production-Ready**: SQLite persistence, REST API, auto-refresh dashboard
+- **Multi-tenant**: Every Google account gets its own calls, costs, sessions, and ingest token
+- **Sessions**: Scope metrics to one experiment, feature, or A/B test
+- **Drop-in Wrapper**: Download `ai_monitor.py` and swap one call to start reporting
+- **Credential Safety**: Provider keys never leave your code, and error text is scrubbed of secrets before it is sent
+- **Production-Ready**: PostgreSQL with a connection pool, REST API, auto-refresh dashboard
 
 ## Tech Stack
 
-- **Backend**: Flask (Python), SQLite
+- **Backend**: Flask (Python), PostgreSQL (production) / SQLite (local)
+- **Auth**: Authlib with Google OAuth 2.0
 - **Frontend**: Vanilla HTML/CSS/JavaScript
-- **Monitoring**: Threading for async anomaly detection, statistical analysis
+- **Monitoring**: Background threads for async anomaly detection, statistical analysis
 
 ## Installation
 
 ```bash
-cd ai-monitor-dashboard
+git clone https://github.com/BasselAtef/AI-Monitor-Dashboard.git
+cd AI-Monitor-Dashboard
 pip install -r requirements.txt
+cp .env.example .env
+```
+
+Then fill in `.env`. Sign-in is required, so the app refuses to start without
+these:
+
+```bash
+# 1. Create an OAuth 2.0 client (type: Web application) at
+#    https://console.cloud.google.com/apis/credentials
+# 2. Add this authorized redirect URI:
+#    http://localhost:5000/auth/google/callback
+GOOGLE_CLIENT_ID=1234567890-xxxx.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxxxxxx
+GOOGLE_REDIRECT_URI=http://localhost:5000/auth/google/callback
+
+# Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+SECRET_KEY=<64 random hex chars>
 ```
 
 ## Usage
@@ -31,7 +54,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Open http://localhost:5000 in your browser.
+Open http://localhost:5000 and sign in with Google.
 
 ### 2. Generate Sample Data
 
@@ -103,18 +126,27 @@ Requires at least 10 baseline calls per provider for statistical accuracy.
 
 ## Deployment
 
-### Local Development
+`Procfile` and `requirements.txt` are already set up, so a Railway or Render
+deploy needs no code changes.
 
-Already running! Just use `python app.py`.
+1. Deploy the repo. The included `Procfile` starts gunicorn, and gunicorn is
+   already pinned in `requirements.txt`.
+2. Add a **PostgreSQL** plugin. The `DATABASE_URL` it injects switches the app
+   from SQLite to Postgres automatically; nothing else changes.
+3. Set these environment variables:
 
-### Production (Railway/Render)
-
-1. Add `Procfile`:
    ```
-   web: gunicorn app:app
+   GOOGLE_CLIENT_ID=...
+   GOOGLE_CLIENT_SECRET=...
+   SECRET_KEY=...                    # python -c "import secrets; print(secrets.token_hex(32))"
+   GOOGLE_REDIRECT_URI=https://<your-app>.up.railway.app/auth/google/callback
+   SESSION_COOKIE_SECURE=1           # serves the session cookie over HTTPS only
+   TZ_OFFSET_HOURS=3
+   DB_POOL_MAX=5                     # keep under your Postgres connection limit
    ```
-2. Update `requirements.txt` to add `gunicorn`
-3. Deploy to Railway or Render (free tier available)
+
+4. Register the deployed callback URI in Google Cloud under
+   Authorized redirect URIs. It must match `GOOGLE_REDIRECT_URI` exactly.
 
 ### Docker
 
@@ -182,13 +214,17 @@ request would exhaust the database's connection limit under load.
 
 ## Known Limitations
 
-- **No authentication.** Anyone with the URL can read all logs. Add auth before
-  exposing this publicly.
 - **Redaction is a regex net, not a guarantee.** It covers the common credential
-  shapes; an unusual error string could still slip something through.
+  shapes (`?key=`, `Bearer`, `x-api-key`, and provider key prefixes); an unusual
+  error string could still slip something through.
+- **Rate limiting is per-connection, not per-account.** An ingest token can post
+  without limit. Add throttling before exposing a shared instance widely.
 - **Migration is additive.** `init_db` creates missing tables and columns; it
   does not move existing SQLite rows into PostgreSQL. Export and re-ingest if
   you want your history.
+- **Pricing is a local snapshot.** Rates in `COST_TABLE` are estimates for
+  reporting, not billing, and they drift. A model missing from the table reports
+  as `n/a` rather than a misleading `$0.00`.
 
 ## Why This Project?
 
