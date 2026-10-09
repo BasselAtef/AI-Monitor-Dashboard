@@ -188,10 +188,21 @@ def monitored_chat(
     headers: Optional[Dict[str, str]] = None,
     **kwargs,
 ) -> Dict[str, Any]:
-    """Call any OpenAI-compatible /chat/completions endpoint with monitoring."""
+    """Call any OpenAI-compatible /chat/completions endpoint with monitoring.
+
+    `provider` is what gets recorded, so it must name the service actually
+    being called. Passing a Gemini model to a helper that reports 'openai'
+    produces a permanently mislabelled row, which then cannot be priced or
+    compared against other Gemini traffic.
+    """
     url = f"{{base_url.rstrip('/')}}/chat/completions"
     request_headers = {{"Content-Type": "application/json"}}
     request_headers.update(headers or {{}})
+
+    # Pop the transport timeout before building the body. Popping it after
+    # would leave 'timeout' in kwargs, and body.update would send it to the
+    # provider as a JSON field, which they reject with a 400.
+    timeout = kwargs.pop("timeout", 120)
 
     body: Dict[str, Any] = {{"model": model, "messages": messages}}
     body.update(kwargs)
@@ -199,7 +210,7 @@ def monitored_chat(
     started = time.time()
     try:
         response = requests.post(
-            url, headers=request_headers, json=body, timeout=kwargs.pop("timeout", 120)
+            url, headers=request_headers, json=body, timeout=timeout
         )
         latency_ms = int((time.time() - started) * 1000)
         response.raise_for_status()
@@ -256,6 +267,45 @@ def monitored_openai_call(api_key: str, model: str = "gpt-4o-mini",
     )
 
 
+def monitored_openai_compatible_call(
+    api_key: str,
+    model: str,
+    messages: Optional[List[Dict[str, str]]] = None,
+    *,
+    provider: str,
+    base_url: str,
+    headers: Optional[Dict[str, str]] = None,
+    **kwargs,
+):
+    """Any OpenAI-compatible /chat/completions endpoint, monitored.
+
+    Use this for providers that publish an OpenAI-compatible API of their own:
+    Gemini's `https://generativelanguage.googleapis.com/v1beta/openai/`,
+    OpenRouter, Together, Groq, or a local vLLM.
+
+    `provider` is required rather than defaulted, because it is the value stored
+    against the call. Guessing it from the model id gets it wrong: a Gemini
+    model reached through an OpenAI-shaped endpoint is still a Gemini call, and
+    recording it as 'openai' misfiles the row and can price it against the
+    wrong table.
+
+    Note that cost is computed server-side from the model id, so the provider
+    label affects display and grouping rather than the rate itself.
+    """
+    request_headers = {{"Authorization": f"Bearer {{api_key}}"}}
+    if headers:
+        request_headers.update(headers)
+    return monitored_chat(
+        provider=provider,
+        api_key=api_key,
+        model=model,
+        messages=messages or [],
+        base_url=base_url,
+        headers=request_headers,
+        **kwargs,
+    )
+
+
 # --------------------------------------------------------------------------
 # Ollama (local)
 # --------------------------------------------------------------------------
@@ -263,12 +313,15 @@ def monitored_ollama_call(model: str = "llama3.2", prompt: str = "",
                           host: str = "http://localhost:11434", **kwargs) -> Dict[str, Any]:
     """Local Ollama generation call, monitored. Tokens are estimated."""
     body: Dict[str, Any] = {{"model": model, "prompt": prompt, "stream": False}}
+    # Popped before the body is built, so it cannot be sent to Ollama as a
+    # generation parameter. Same ordering rule as monitored_chat.
+    timeout = kwargs.pop("timeout", 300)
     body.update(kwargs)
 
     started = time.time()
     try:
         response = requests.post(
-            f"{{host.rstrip('/')}}/api/generate", json=body, timeout=kwargs.pop("timeout", 300)
+            f"{{host.rstrip('/')}}/api/generate", json=body, timeout=timeout
         )
         latency_ms = int((time.time() - started) * 1000)
         response.raise_for_status()
