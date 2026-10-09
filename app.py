@@ -19,6 +19,7 @@ from collections import defaultdict
 import statistics
 
 import db
+import pricing
 from db import cursor, init_db, table_columns, local_time_sql, hour_bucket_sql
 from monitor_wrapper import build_wrapper
 from auth import (
@@ -69,6 +70,12 @@ bootstrap()
 
 app = Flask(__name__)
 init_oauth(app)
+
+# Pull in LiteLLM now, in the background, so the first call to an unpriced
+# model does not stall its telemetry POST on a five-second import. Daemon, so it
+# never holds up shutdown, and its failure is ignored: pricing is a fallback,
+# not a precondition for serving.
+threading.Thread(target=pricing.warm_up, daemon=True).start()
 
 # Browser reads only; the UI is same-origin. The telemetry endpoint accepts a
 # cross-origin ingest token, so CORS stays scoped to that one route.
@@ -156,16 +163,29 @@ def _format_ts(value):
 
 
 def price_for(provider, model):
-    """Resolve a rate table, or None when the model is not priced.
+    """Resolve a rate table, or None when the model is not priced anywhere.
 
-    Matching is by longest prefix, so 'gpt-4o' is not swallowed by the
-    'gpt-4o-mini' row and 'llama-3.1-8b-instant' resolves to the 8b row.
+    COST_TABLE is checked first and wins when it matches. LiteLLM is the
+    fallback for models the table has not caught up with, such as a provider
+    releasing a new id between releases of this file.
+
+    Matching within the table is by longest prefix, so 'gpt-4o' is not
+    swallowed by the 'gpt-4o-mini' row and 'llama-3.1-8b-instant' resolves to
+    the 8b row.
 
     Some providers namespace their ids ('qwen/qwen3.8-27b' on Groq), so the
     segment after the last slash is tried as well. Without that, a table key
     of 'groq/qwen3.8-27b' would never match, and the call would silently read
     as unpriced.
     """
+    table = _table_rate(provider, model)
+    if table is not None:
+        return table
+    return pricing.lookup_rates(provider, model)
+
+
+def _table_rate(provider, model):
+    """COST_TABLE-only lookup, with no fallback."""
     provider = (provider or "").lower()
     model = (model or "").lower()
 

@@ -167,6 +167,25 @@ Prices per 1M tokens. Model ids are matched by longest prefix, so
 get swallowed by `gpt-4o-mini`. These are local estimates for reporting, not
 charges — the dashboard never calls a provider.
 
+Resolution order:
+
+1. **`COST_TABLE` in `app.py`.** The hand-checked table below, always
+   authoritative. It wins even where LiteLLM disagrees.
+2. **LiteLLM's price map** (`pricing.py`), for ids the table has not caught up
+   with, such as a provider shipping a new model. Per-token rates are scaled by
+   1M to match the table's shape.
+3. **`n/a`.** When neither source knows the model, the call is left unpriced
+   rather than recorded as `$0.00`, which would read as free.
+
+`COST_TABLE` staying first is deliberate: it is explicit and reviewable, so the
+numbers you report can be checked by reading one file. LiteLLM covers the long
+tail nobody hand-maintains.
+
+LiteLLM is a heavy import (~5s, pulls `openai`, `tiktoken`, `boto3`,
+`huggingface-hub`). `pricing.py` therefore imports it lazily and warms it in a
+background thread at boot, so it never sits on the telemetry path. If it is
+missing, every route still works and unpriced models report `n/a`.
+
 | Provider/Model              | Input  | Output  |
 | --------------------------- | ------ | ------- |
 | Gemini 3.8 Flash            | $0.75  | $3.75   |
@@ -188,6 +207,14 @@ charges — the dashboard never calls a provider.
 | Groq Llama 3.1 8B           | $0.05  | $0.08   |
 | Mistral Large               | $2.00  | $6.00   |
 | Qwen 3.8                    | $0.80  | $4.00   |
+
+Resolved from LiteLLM rather than the table, shown here for reference:
+
+| Provider/Model              | Input  | Output  |
+| --------------------------- | ------ | ------- |
+| Groq-hosted GPT-OSS 20B     | $0.075 | $0.30   |
+| Groq-hosted GPT-OSS 120B    | $0.15  | $0.60   |
+| OpenAI GPT-4.1              | $2.00  | $8.00   |
 
 ## Timezone
 
@@ -223,8 +250,9 @@ request would exhaust the database's connection limit under load.
   does not move existing SQLite rows into PostgreSQL. Export and re-ingest if
   you want your history.
 - **Pricing is a local snapshot.** Rates in `COST_TABLE` are estimates for
-  reporting, not billing, and they drift. A model missing from the table reports
-  as `n/a` rather than a misleading `$0.00`.
+  reporting, not billing, and they drift. A model missing from the table falls
+  back to LiteLLM's price map, and if neither knows it, the call reports `n/a`
+  rather than a misleading `$0.00`.
 
 ## Why This Project?
 

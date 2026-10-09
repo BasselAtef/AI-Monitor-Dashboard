@@ -6,3 +6,7 @@ cryptography==50.0.2
 python-dotenv==1.2.4
 psycopg[binary,pool]==3.3.6
 gunicorn==26.2.0
+# Fallback price lookup for models missing from COST_TABLE. Heavier than the
+# rest (pulls openai, tiktoken, boto3, huggingface-hub) and takes ~5s to
+# import, so pricing.py imports it lazily and only when a model is unpriced.
+litellm==1.104.2
