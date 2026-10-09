@@ -403,15 +403,37 @@ def log_api_call():
     status = data.get('status', 'success')
     error_message = data.get('error_message', None)
 
+    # Reasoning models bill their thinking against the completion budget, so
+    # completion_tokens alone overstates what actually reached the caller. Kept
+    # as a nullable column rather than folded into the totals: total_tokens and
+    # the cost calculation must still reflect every billed token.
+    reasoning_tokens = data.get('reasoning_tokens')
+    reasoning_tokens = int(reasoning_tokens) if reasoning_tokens is not None else None
+    finish_reason = data.get('finish_reason') or None
+
+    # A response the provider truncated is not a success. The wrapper still
+    # returns it, so the caller's code runs on partial output and often fails
+    # downstream. Recording it as 'success' let an empty 4,096-token response
+    # look like a healthy call in the dashboard.
+    truncated = finish_reason == 'length'
+    if truncated and status == 'success':
+        status = 'truncated'
+        error_message = error_message or (
+            'response truncated by the provider: finish_reason="length". '
+            'The output budget was exhausted, so the response is incomplete.'
+        )
+
     cost_usd = calculate_cost(provider, model, prompt_tokens, completion_tokens)
 
     with cursor() as c:
         c.execute("""INSERT INTO api_calls
                      (provider, model, prompt_tokens, completion_tokens, total_tokens,
+                      reasoning_tokens, finish_reason,
                       latency_ms, cost_usd, status, error_message, user_id)
-                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                      RETURNING id""",
                   (provider, model, prompt_tokens, completion_tokens, total_tokens,
+                   reasoning_tokens, finish_reason,
                    latency_ms, cost_usd, status, error_message, user_id))
         call_id = c.fetchone()["id"]
 
@@ -455,7 +477,12 @@ def get_stats():
 
         c.execute("""SELECT COUNT(*) AS total_calls,
                      SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successful,
+                     SUM(CASE WHEN status = 'truncated' THEN 1 ELSE 0 END) AS truncated,
                      SUM(total_tokens) AS total_tokens,
+                     SUM(reasoning_tokens) AS reasoning_tokens,
+                     SUM(CASE WHEN reasoning_tokens IS NOT NULL
+                              THEN completion_tokens - reasoning_tokens
+                              ELSE completion_tokens END) AS output_tokens,
                      SUM(cost_usd) AS total_cost,
                      AVG(latency_ms) AS avg_latency
                      FROM api_calls
@@ -464,6 +491,7 @@ def get_stats():
 
         total_calls = agg.get("total_calls") or 0
         successful = agg.get("successful") or 0
+        truncated = agg.get("truncated") or 0
         total_tokens = agg.get("total_tokens") or 0
         total_cost = agg.get("total_cost") or 0.0
         avg_latency = agg.get("avg_latency") or 0
@@ -530,7 +558,14 @@ def get_stats():
     return jsonify({
         "total_calls": total_calls,
         "success_rate": round(success_rate, 2),
+        "truncated_calls": truncated,
         "total_tokens": total_tokens,
+        # Reasoning tokens are billed but never returned to the caller, so
+        # output_tokens is the figure that reflects what the app actually
+        # received. Comparing either across runs needs this split: on a
+        # reasoning model the two differ by a factor of several.
+        "reasoning_tokens": agg.get("reasoning_tokens") or 0,
+        "output_tokens": agg.get("output_tokens") or 0,
         # PostgreSQL NUMERIC arrives as Decimal, which jsonify renders as a string.
         # Coerce to float so the API contract is numeric on both backends.
         "total_cost": total_cost,
@@ -554,18 +589,34 @@ def get_recent_calls():
         # id breaks ties: SQLite timestamps have second precision, so several
         # rows written in the same second otherwise sort unpredictably.
         c.execute(f"""SELECT {conn_local} AS local_time, provider, model,
-                             total_tokens, latency_ms, cost_usd, status, error_message
+                             prompt_tokens, completion_tokens, total_tokens,
+                             reasoning_tokens, finish_reason,
+                             latency_ms, cost_usd, status, error_message
                       FROM api_calls
                       WHERE user_id = %s
                       ORDER BY timestamp DESC, id DESC LIMIT %s""", (uid, limit))
 
         calls = []
         for row in c.fetchall():
+            reasoning = row["reasoning_tokens"]
+            completion = row["completion_tokens"]
+            # Reasoning is billed as output, so `tokens` stays the full total.
+            # A NULL reasoning count means the provider or wrapper did not
+            # report one, which is not a claim of zero. Fall back to the whole
+            # completion count, the same figure shown before this split
+            # existed, so a non-reasoning model is unaffected.
+            output_tokens = (completion if reasoning is None
+                             else max(0, (completion or 0) - reasoning))
             calls.append({
                 "timestamp": _format_ts(row["local_time"]),
                 "provider": row["provider"],
                 "model": row["model"],
                 "tokens": row["total_tokens"],
+                "prompt_tokens": row["prompt_tokens"],
+                "completion_tokens": completion,
+                "reasoning_tokens": reasoning,
+                "output_tokens": output_tokens,
+                "finish_reason": row["finish_reason"],
                 "latency_ms": row["latency_ms"],
                 "cost_usd": (None if row["cost_usd"] is None
                             else round(float(row["cost_usd"]), 8)),

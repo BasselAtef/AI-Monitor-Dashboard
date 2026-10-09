@@ -132,18 +132,32 @@ def log_call(
     latency_ms: int = 0,
     status: str = "success",
     error: Optional[str] = None,
+    reasoning_tokens: Optional[int] = None,
+    finish_reason: Optional[str] = None,
 ) -> None:
     """Send one call to the dashboard. Never raises.
 
     The full model id is sent on purpose: the dashboard matches it against its
     pricing table by prefix, including namespaced ids such as
     'qwen/qwen3.8-27b', so the cost resolves correctly.
+
+    reasoning_tokens is what the model spent thinking, which providers bill
+    against the completion budget but never return as content. It is sent
+    separately so the dashboard can report output tokens honestly; omitting it
+    is fine and simply leaves that split unknown.
+
+    finish_reason is the provider's own verdict. 'length' means the response
+    was cut off, and the dashboard records that as truncated rather than a
+    success, because the caller received a partial answer.
     """
     payload = {{
         "provider": provider,
         "model": model or "unknown",
         "prompt_tokens": int(prompt_tokens or 0),
         "completion_tokens": int(completion_tokens or 0),
+        "reasoning_tokens": (None if reasoning_tokens is None
+                             else int(reasoning_tokens)),
+        "finish_reason": finish_reason,
         "latency_ms": int(latency_ms or 0),
         "status": status,
         "error_message": redact_secrets(error)[:500] or None,
@@ -174,6 +188,44 @@ def _extract_usage(response_json: Dict[str, Any]) -> Any:
             "completion_tokens": metadata.get("candidatesTokenCount", 0),
         }}
     return {{}}
+
+
+def _extract_reasoning(response_json: Dict[str, Any]) -> Optional[int]:
+    """Tokens the model spent reasoning, if the provider reports them.
+
+    Reasoning models such as gpt-oss-20b bill their thinking against the
+    completion budget, so completion_tokens overstates what the caller actually
+    received. Providers differ in where they put the figure, so the two known
+    spellings are both checked.
+
+    Returns None when the provider reports nothing, which is meaningfully
+    different from 0: it means "no reasoning" rather than "did not say".
+    """
+    usage = response_json.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("completion_tokens_details")
+    if isinstance(details, dict):
+        for key in ("reasoning_tokens", "reasoning"):
+            value = details.get(key)
+            if isinstance(value, (int, float)):
+                return int(value)
+    # Some gateways flatten it onto usage directly.
+    for key in ("reasoning_tokens", "reasoning"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            return int(value)
+    return None
+
+
+def _extract_finish_reason(response_json: Dict[str, Any]) -> Optional[str]:
+    """The provider's verdict on the response, if present."""
+    choices = response_json.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        reason = choices[0].get("finish_reason")
+        if isinstance(reason, str):
+            return reason
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -222,6 +274,8 @@ def monitored_chat(
             model=model,
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
+            reasoning_tokens=_extract_reasoning(result),
+            finish_reason=_extract_finish_reason(result),
             latency_ms=latency_ms,
             status="success",
         )
@@ -328,11 +382,14 @@ def monitored_ollama_call(model: str = "llama3.2", prompt: str = "",
         result = response.json()
 
         text = result.get("response", "")
+        # Ollama signals a truncated generation with done_reason "length".
+        done_reason = result.get("done_reason")
         log_call(
             provider="ollama",
             model=model,
             prompt_tokens=_estimate_tokens(prompt),
             completion_tokens=_estimate_tokens(text),
+            finish_reason=done_reason if isinstance(done_reason, str) else None,
             latency_ms=latency_ms,
             status="success",
         )

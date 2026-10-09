@@ -138,6 +138,27 @@
             font-weight: 600;
         }
 
+        /* Truncated is a failure, but not an exception: the provider answered
+           and simply ran out of budget. Amber, so it reads differently from a
+           transport or auth error. */
+        .status-truncated {
+            color: #b8860b;
+            font-weight: 600;
+        }
+
+        .stat-note,
+        .token-detail {
+            font-size: 11px;
+            font-weight: 400;
+            color: #6c757d;
+            margin-top: 3px;
+            letter-spacing: 0;
+        }
+
+        .stat-note {
+            color: #8a6d3b;
+        }
+
         .provider-tag {
             display: inline-block;
             padding: 4px 8px;
@@ -549,7 +570,26 @@ result = monitored_groq_call(
                     if (n) n.remove();
                 }
                 document.getElementById('avgLatency').textContent = Math.round(stats.avg_latency_ms);
-                document.getElementById('totalTokens').textContent = stats.total_tokens.toLocaleString();
+                // Reasoning tokens are billed but never returned to the caller,
+                // so the headline count is billed tokens with the real output
+                // called out underneath.
+                const tokensEl = document.getElementById('totalTokens');
+                const reasoning = stats.reasoning_tokens || 0;
+                if (reasoning > 0) {
+                    const share = Math.round(reasoning / stats.total_tokens * 100);
+                    tokensEl.innerHTML = stats.total_tokens.toLocaleString()
+                        + `<div class="stat-note" title="Tokens the model spent reasoning. Billed as output, never returned.">`
+                        + `${stats.output_tokens.toLocaleString()} usable &middot; ${reasoning.toLocaleString()} reasoning (${share}%)</div>`;
+                } else {
+                    tokensEl.textContent = stats.total_tokens.toLocaleString();
+                }
+
+                if (stats.truncated_calls > 0) {
+                    showTruncatedNotice(stats.truncated_calls);
+                } else {
+                    const t = document.getElementById('truncatedNotice');
+                    if (t) t.remove();
+                }
                 
                 // Update anomalies
                 const anomaliesContainer = document.getElementById('anomaliesContainer');
@@ -612,10 +652,20 @@ result = monitored_groq_call(
                                         <td>${new Date(call.timestamp).toLocaleTimeString()}</td>
                                         <td><span class="provider-tag provider-${call.provider}">${call.provider}</span></td>
                                         <td>${call.model}</td>
-                                        <td>${call.tokens.toLocaleString()}</td>
+                                        <td>${call.tokens.toLocaleString()}${
+                                            call.reasoning_tokens
+                                            ? `<div class="token-detail" title="Tokens the model spent reasoning. Billed as output, never returned as content.">`
+                                              + `${call.output_tokens.toLocaleString()} usable &middot; `
+                                              + `${call.reasoning_tokens.toLocaleString()} reasoning</div>`
+                                            : ''
+                                        }</td>
                                         <td>${call.latency_ms}ms</td>
                                         <td>${call.cost_usd === null ? '<span title="no price for this model">n/a</span>' : '$' + call.cost_usd.toFixed(4)}</td>
-                                        <td class="status-${call.status}">${call.status}</td>
+                                        <td class="status-${call.status}">${call.status}${
+                                            call.finish_reason === 'length'
+                                            ? '<div class="token-detail">output budget exhausted</div>'
+                                            : ''
+                                        }</td>
                                     </tr>
                                 `).join('')}
                             </tbody>
@@ -748,8 +798,22 @@ function showUnpricedNotice(models) {
         'in <code>app.py</code>.';
 }
 
+function showTruncatedNotice(count) {
+    let box = document.getElementById('truncatedNotice');
+    if (!box) {
+        box = document.createElement('div');
+        box.id = 'truncatedNotice';
+        box.style.cssText = 'background:#fff1f0;padding:14px;border-radius:8px;' +
+            'margin-bottom:20px;border-left:4px solid #dc3545;font-size:13px;color:#842029;';
+        document.querySelector('.container').insertBefore(box, document.querySelector('.stats-grid'));
+    }
+    box.innerHTML = '<strong>' + count + ' truncated ' + (count === 1 ? 'response' : 'responses') + ':</strong> ' +
+        'the provider ran out of output budget (<code>finish_reason: "length"</code>), so the ' +
+        'response was cut off partway. These are counted as failures, not successes, ' +
+        'because the caller received a partial answer. Raising <code>max_tokens</code> is the fix.';
+}
+
 async function showAccountPanel() {
-    const panel = document.getElementById('accountPanel');
     panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
     if (panel.style.display === 'none') return;
 

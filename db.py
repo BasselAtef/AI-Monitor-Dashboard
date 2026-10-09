@@ -199,6 +199,8 @@ CREATE TABLE IF NOT EXISTS api_calls (
     prompt_tokens INTEGER,
     completion_tokens INTEGER,
     total_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    finish_reason TEXT,
     latency_ms INTEGER,
     cost_usd REAL,
     status TEXT,
@@ -248,6 +250,8 @@ CREATE TABLE IF NOT EXISTS api_calls (
     prompt_tokens INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
     total_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER,
+    finish_reason TEXT,
     latency_ms INTEGER DEFAULT 0,
     cost_usd NUMERIC(12, 8) DEFAULT 0,
     status TEXT,
@@ -305,6 +309,7 @@ def init_db(retries: int = 5, delay: float = 2.0) -> None:
             with cursor() as cur:
                 for statement in statements:
                     cur.execute(statement)
+            _add_missing_columns()
             return
         except Exception as exc:
             last_error = exc
@@ -334,6 +339,31 @@ def init_db(retries: int = 5, delay: float = 2.0) -> None:
             else "Check that the directory is writable.\n"
         )
     ) from last_error
+
+
+# Columns added after the first release, applied to tables that already exist.
+# CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so a deployed
+# database would silently keep the old shape and every INSERT naming a new
+# column would fail. Nullable with no default, so existing rows read as NULL
+# (unknown) rather than 0 (which would read as "no reasoning", a false claim).
+MIGRATIONS = [
+    ("api_calls", "reasoning_tokens", "INTEGER"),
+    ("api_calls", "finish_reason", "TEXT"),
+]
+
+
+def _add_missing_columns() -> None:
+    """ALTER TABLE for any column a deployed database is missing."""
+    for table, column, coltype in MIGRATIONS:
+        if column in table_columns(table):
+            continue
+        # SQLite has no ADD COLUMN IF NOT EXISTS, so the check above is what
+        # keeps this idempotent there.
+        with cursor() as cur:
+            cur.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"
+            )
+        print(f"[db] added {table}.{column} {coltype}", flush=True)
 
 
 def _redacted_url() -> str:

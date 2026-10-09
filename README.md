@@ -124,6 +124,42 @@ The system automatically detects:
 
 Requires at least 10 baseline calls per provider for statistical accuracy.
 
+## Reasoning Tokens and Truncation
+
+Reasoning models such as `gpt-oss-20b` spend part of their output budget
+thinking before writing any answer. Providers bill that against
+`max_tokens` but never return it as content, so `completion_tokens` alone
+overstates what your code actually received.
+
+Measured on one prompt, `temperature=0`:
+
+| Budget | Reasoning | Usable output | Result |
+| ------ | --------- | ------------- | ------ |
+| 4096 | up to 4,094 | ~0 | mostly empty responses |
+| 8192 | up to 4,780 | ~1,075 | complete |
+
+The dashboard therefore records three figures per call:
+
+- `prompt_tokens` — what you sent
+- `reasoning_tokens` — what the model spent thinking (from
+  `usage.completion_tokens_details.reasoning_tokens`)
+- `output_tokens` — `completion_tokens - reasoning_tokens`, what came back
+
+`total_tokens` and the cost calculation still include reasoning, because you are
+billed for it. Providers that do not report a reasoning count store `NULL`,
+which is *unknown*, not zero; `output_tokens` then falls back to the full
+completion count.
+
+### Truncation is not a success
+
+When a response is cut off, the provider sets `finish_reason: "length"`. The
+wrapper passes that through and the dashboard records the call as `truncated`,
+not `success`, because the caller received a partial answer. Truncated calls
+count against the success rate and raise a notice on the dashboard.
+
+This matters in practice: at `max_tokens=4096` a search returned an empty
+string while looking like a healthy call. The usual fix is raising the budget.
+
 ## Deployment
 
 `Procfile` and `requirements.txt` are already set up, so a Railway or Render
@@ -253,6 +289,12 @@ request would exhaust the database's connection limit under load.
   reporting, not billing, and they drift. A model missing from the table falls
   back to LiteLLM's price map, and if neither knows it, the call reports `n/a`
   rather than a misleading `$0.00`.
+- **Reasoning is only counted when the provider reports it.** Groq exposes
+  `reasoning_tokens`; others may not, in which case `output_tokens` equals the
+  full completion count and the split is unknown rather than absent.
+- **Reasoning length is not stable.** On identical input at `temperature=0` it
+  ranged from 1,550 to 4,780 tokens. Latency and cost are reproducible metrics;
+  raw completion tokens on a reasoning model are not.
 
 ## Why This Project?
 
