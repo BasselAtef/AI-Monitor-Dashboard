@@ -814,6 +814,7 @@ function showTruncatedNotice(count) {
 }
 
 async function showAccountPanel() {
+    const panel = document.getElementById('accountPanel');
     panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
     if (panel.style.display === 'none') return;
 
