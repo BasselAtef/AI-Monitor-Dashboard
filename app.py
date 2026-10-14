@@ -349,29 +349,6 @@ def google_callback():
     return redirect(url_for("index"))
 
 
-@app.route('/api/health')
-def health():
-    """Which backend is actually serving this instance.
-
-    Unauthenticated on purpose, and deliberately revealing nothing sensitive:
-    it reports the storage engine and whether calls will survive a redeploy,
-    which is the single most common production surprise here. The database URL
-    itself is never returned, because it carries a password.
-
-    A 200 with backend=sqlite and persistent=false means every redeploy starts
-    from an empty database.
-    """
-    persistent = db.using_postgres()
-    return jsonify({
-        "status": "ok",
-        "backend": "postgresql" if persistent else "sqlite",
-        "persistent": persistent,
-        "warning": (None if persistent else
-                    "SQLite is in use. Recorded calls are lost on redeploy "
-                    "unless a persistent volume is mounted."),
-    }), 200
-
-
 @app.route('/logout')
 def logout():
     session.clear()
