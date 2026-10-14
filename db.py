@@ -51,6 +51,45 @@ def using_postgres() -> bool:
     return DATABASE_URL.startswith(("postgres://", "postgresql://"))
 
 
+def warn_if_ephemeral() -> None:
+    """Refuse to lose data quietly on SQLite in a deployed environment.
+
+    SQLite is the right default locally, but a deployed container filesystem is
+    ephemeral: every redeploy starts from an empty monitor.db and the dashboard
+    looks like a fresh install, with nothing in the logs to explain why.
+
+    Observed in practice: reported as "the data disappears on every redeploy".
+    The bug was never the platform, it was this fallback being silent.
+
+    ALLOW_SQLITE=1 suppresses this when a file-backed deployment is genuinely
+    intended, such as a single-container app with a mounted volume.
+    """
+    if using_postgres():
+        return
+    if os.environ.get("ALLOW_SQLITE", "").strip() in ("1", "true", "yes"):
+        return
+
+    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RENDER") \
+            or os.environ.get("FLY_APP_NAME") or os.environ.get("DYNO"):
+        raise SystemExit(
+            "Cannot start: no PostgreSQL DATABASE_URL in this environment.\n"
+            "  detected a PaaS-style deploy with an ephemeral filesystem.\n\n"
+            "SQLite was selected, and every redeploy would start from an empty\n"
+            "database, silently discarding all recorded API calls.\n\n"
+            "Fix it:\n"
+            "  - add a PostgreSQL plugin to this service; it injects DATABASE_URL\n"
+            "  - or set DATABASE_URL to an external PostgreSQL instance\n"
+            "  - or, if a file-backed database really is intended, set\n"
+            "    ALLOW_SQLITE=1 and mount a persistent volume\n"
+        )
+
+    print(
+        "[db] using local SQLite at monitor.db. Data is lost if this\n"
+        "     directory is ephemeral. Set DATABASE_URL for a deployed app.",
+        flush=True,
+    )
+
+
 # --------------------------------------------------------------------------
 # local-time SQL, per dialect
 # --------------------------------------------------------------------------
@@ -302,6 +341,8 @@ def init_db(retries: int = 5, delay: float = 2.0) -> None:
     """
     schema = SCHEMA_POSTGRES if using_postgres() else SCHEMA_SQLITE
     statements = [s for s in schema.split(";") if s.strip()]
+
+    warn_if_ephemeral()
 
     last_error = None
     for attempt in range(1, retries + 1):

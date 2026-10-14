@@ -1,6 +1,24 @@
 # AI System Monitor
 
-Real-time monitoring dashboard for LLM API calls with cost tracking, latency analysis, and anomaly detection. Multi-tenant, with Google sign-in.
+Real-time monitoring dashboard for LLM API calls with cost tracking, latency
+analysis, and anomaly detection. Multi-tenant, with Google sign-in.
+
+## Health check
+
+`GET /api/health` reports which storage backend is live:
+
+```json
+{"status": "ok", "backend": "postgresql", "persistent": true, "warning": null}
+```
+
+`persistent: false` means SQLite, which lives on an ephemeral container
+filesystem: **every redeploy starts from an empty database**. The warning field
+explains that in place.
+
+The app refuses to start on a PaaS (Railway, Render, Fly, Heroku) without
+`DATABASE_URL`, because the silent fallback to SQLite there loses all recorded
+calls on each deploy. Set `ALLOW_SQLITE=1` to override when a file-backed
+database really is intended, such as a container with a mounted volume.
 
 ## Features
 
@@ -97,6 +115,7 @@ report only calls made since that point.
 
 ## API Endpoints
 
+- `GET /api/health` - Storage backend and whether data survives a redeploy (no auth)
 - `POST /api/log` - Log an API call
 - `GET /api/stats?hours=24` - Get dashboard statistics
 - `GET /api/recent-calls?limit=50` - Get recent call logs
